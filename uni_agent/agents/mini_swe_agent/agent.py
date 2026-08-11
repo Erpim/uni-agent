@@ -1,16 +1,26 @@
-"""mini-swe-agent: black-box agent launched *inside* the sandbox. NOT YET IMPLEMENTED.
+"""mini-swe-agent: a black-box agent that runs the real mini-swe-agent inside the sandbox.
 
-Planned: install mini-swe-agent into an isolated venv (off the task image's env), point
-it at ``config.model`` via LiteLLM, launch it against ``/testbed``, and let the task's
-reward step score the resulting ``git diff``.
+mini-swe-agent is launched *in* the sandbox from a prebuilt tool image (venv at
+``/opt/mini-swe-agent``) whose ``bin/run_agent.py`` reads a task config from
+**stdin** and writes the result JSON to **stdout**. This agent is the thin
+re-homing of the old recipe runner's core: build the config (with the gateway
+URL rewritten to the sandbox-internal tunnel), pipe it in via base64, and parse
+the result JSON out of stdout. The tool image, ``run_agent.py`` and the
+stdin/stdout protocol are reused unchanged.
 
 Reference: https://github.com/SWE-agent/mini-swe-agent
 """
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
+import shlex
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
+
+from pydantic import Field
 
 from ..base import Agent, AgentConfig, AgentResult
 from ..registry import register_agent
@@ -20,16 +30,109 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_PROXY_PORT = 38197
+TOOL_PYTHON = "/opt/mini-swe-agent/bin/python"
+RUN_AGENT_SCRIPT = "/opt/mini-swe-agent/bin/run_agent.py"
+
+
+def extract_upstream(gateway_url: str) -> str:
+    """Extract ``host:port`` from a gateway URL for the upstream tunnel config."""
+    parsed = urlparse(gateway_url)
+    return f"{parsed.hostname}:{parsed.port}"
+
+
+def rewrite_gateway_url(
+    gateway_url: str,
+    proxy_port: int = DEFAULT_PROXY_PORT,
+    *,
+    strip_v1: bool = False,
+) -> str:
+    """Rewrite a gateway URL to the sandbox-internal tunnel (``127.0.0.1:<proxy_port>``).
+
+    Replaces host:port with ``127.0.0.1:<proxy_port>`` and keeps the path, so the
+    mini-swe-agent endpoint inside the sandbox reaches the gateway through the
+    reverse tunnel. Example: ``http://8.92.9.155:40169/sessions/abc/v1`` ->
+    ``http://127.0.0.1:38197/sessions/abc/v1``.
+    """
+    parsed = urlparse(gateway_url)
+    path = parsed.path.removesuffix("/v1") if strip_v1 else parsed.path
+    return f"http://127.0.0.1:{proxy_port}{path}"
+
+
+def build_agent_command(
+    *,
+    config_b64: str,
+    conda_env: str = "testbed",
+    tool_python: str = TOOL_PYTHON,
+    run_agent_script: str = RUN_AGENT_SCRIPT,
+) -> str:
+    """Build the shell command that runs ``run_agent.py`` inside the sandbox.
+
+    The task config is piped via base64-encoded stdin (the protocol ``run_agent.py``
+    expects). The tool python is called through the task's conda env so mini-swe-agent
+    resolves the repo environment inside ``/testbed``.
+    """
+    conda_prefix = f"/opt/miniconda3/envs/{conda_env}"
+    run_agent_env = (
+        f"CONDA_DEFAULT_ENV={shlex.quote(conda_env)} "
+        f"CONDA_PREFIX={shlex.quote(conda_prefix)} "
+        f"PATH={shlex.quote(conda_prefix + '/bin')}:/opt/miniconda3/bin:$PATH "
+        "PIP_DISABLE_PIP_VERSION_CHECK=1 "
+        "PIP_PROGRESS_BAR=off"
+    )
+    return (
+        "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy; "
+        f"printf %s {shlex.quote(config_b64)} | base64 -d | "
+        f"env {run_agent_env} {tool_python} {run_agent_script}"
+    )
+
+
+def parse_agent_result(stdout: str) -> dict[str, Any]:
+    """Parse the result JSON from ``run_agent.py``'s stdout.
+
+    litellm may print error/noise lines to stdout, polluting the output, so the last
+    line starting with ``{`` wins; fall back to the whole stdout, then to an error marker.
+    """
+    stdout = stdout.strip()
+    if not stdout:
+        return {"exit_status": "error", "submission": ""}
+    for line in reversed([ln.strip() for ln in stdout.split("\n") if ln.strip()]):
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        logger.warning("mini_swe_agent: failed to parse agent result (stdout tail): %.1000s", stdout)
+        return {"exit_status": "error", "submission": ""}
+
 
 class MiniSweAgentConfig(AgentConfig):
     """Black-box launch params for mini-swe-agent (endpoint lives on :attr:`AgentConfig.model`)."""
 
     name: str = "mini_swe_agent"
+    step_limit: int = Field(default=100, description="mini-swe-agent max agent steps.")
+    run_timeout: float = Field(default=7200.0, description="Wallclock cap (s) on the agent process.")
+    conda_env: str = Field(default="testbed", description="Task repo conda env, activated around the launch.")
+    proxy_port: int = Field(
+        default=DEFAULT_PROXY_PORT,
+        description="Sandbox-internal tunnel port (must match the sandbox's proxy_port).",
+    )
+    tool_python: str = Field(
+        default=TOOL_PYTHON,
+        description="Prebuilt tool-image python that runs run_agent.py.",
+    )
+    run_agent_script: str = Field(
+        default=RUN_AGENT_SCRIPT,
+        description="In-tool-image entrypoint script reading config from stdin.",
+    )
 
 
 @register_agent("mini_swe_agent")
 class MiniSweAgentAgent(Agent):
-    """Black-box solver stub: will launch mini-swe-agent in the sandbox (``run`` not yet implemented)."""
+    """Black-box solver: launch mini-swe-agent in the sandbox against ``config.model``."""
 
     config_model = MiniSweAgentConfig
 
@@ -39,4 +142,53 @@ class MiniSweAgentAgent(Agent):
         sandbox: Sandbox,
         messages: list[dict[str, Any]],
     ) -> AgentResult:
-        pass
+        cfg: MiniSweAgentConfig = self.config  # type: ignore[assignment]
+        if cfg.model.base_url is None:
+            raise ValueError("mini_swe_agent: config.model.base_url is not set (the gateway/vLLM policy endpoint)")
+        task = self._extract_task(messages)
+
+        # 1) Build the task config; the gateway URL is rewritten to the sandbox-internal
+        #    tunnel (same as the old runner's _build_task_config).
+        task_config = {
+            "task": task,
+            "gateway_url": rewrite_gateway_url(cfg.model.base_url, cfg.proxy_port),
+            "agent": {"step_limit": cfg.step_limit},
+        }
+        config_b64 = base64.b64encode(json.dumps(task_config).encode()).decode()
+
+        # 2) Pipe it into the prebuilt tool-image python (unchanged stdin/stdout protocol).
+        agent_cmd = build_agent_command(
+            config_b64=config_b64,
+            conda_env=cfg.conda_env,
+            tool_python=cfg.tool_python,
+            run_agent_script=cfg.run_agent_script,
+        )
+        result = await sandbox.exec_shell(agent_cmd, timeout=cfg.run_timeout)
+
+        # 3) Parse the result JSON from stdout (litellm noise tolerated).
+        agent_info = parse_agent_result(result.stdout or "")
+        logger.info(
+            "mini_swe_agent: done exit_status=%s submission=%d chars rc=%s",
+            agent_info.get("exit_status"),
+            len(agent_info.get("submission", "")),
+            result.exit_code,
+        )
+        return AgentResult(
+            output=agent_info,
+            transcript=list(messages),
+            info={"step_limit": cfg.step_limit, "exit_status": agent_info.get("exit_status")},
+            # Explicit completion: mini-swe-agent reports "Submitted" only when it
+            # produced a submission; anything else (error/timeout) is "not finished",
+            # so those episodes can be masked from the loss via
+            # mask_unfinished_episode=True in the framework config.
+            finished=agent_info.get("exit_status") == "Submitted",
+        )
+
+    @staticmethod
+    def _extract_task(messages: list[dict[str, Any]]) -> str:
+        if len(messages) > 2:
+            raise ValueError(f"mini_swe_agent accepts at most 2 messages (system?, user), got {len(messages)}")
+        problem = next((m["content"] for m in messages if m.get("role") == "user"), None)
+        if not problem:
+            raise ValueError("mini_swe_agent requires a 'user' message (the problem statement)")
+        return problem
