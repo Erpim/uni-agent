@@ -1,0 +1,87 @@
+# Task Config for the jiuwenswarm blackbox recipe.
+#
+# The sample rows (produced by `uni_agent.tasks.swe_rebench.preprocess` /
+# `uni_agent.tasks.swe_bench.preprocess`) carry only the canonical sandbox image name
+# (`sandbox.image`) plus prompt/metadata; everything below is the per-task default
+# layered on top by `TaskConfigResolver` (file defaults -> sample values -> runtime
+# model binding).
+#
+# Two datasets, same recipe: **swe_rebench** is used for RL training, **swe_bench**
+# for evaluation/validation — mirroring the other task configs in this repo.
+#
+# - sandbox.provider=openyuanrong reuses `uni_agent.sandbox.openyuanrong`; the
+#   sandbox mounts the prebuilt tool image (workswarm + run_agent.sh) at
+#   /opt/jiuwenswarm.
+# - sandbox.sandbox_kwargs.proxy_port is the in-sandbox reverse-tunnel port; the
+#   runtime `upstream` (gateway host:port) is injected by `run_task`, which also
+#   rewrites the agent's model.base_url to http://127.0.0.1:<proxy_port> so the
+#   agent itself stays tunnel-agnostic.
+# - agent.model.base_url/api_key/model_name are injected at runtime from the
+#   gateway session; run_task rewrites base_url to the tunnel address when a
+#   tunnel is configured (openyuanrong sandboxes only).
+# - agent.tool_script is REQUIRED: it names the path inside the prebuilt tool
+#   image (mounted at /opt/jiuwenswarm); change it together with the tool image.
+# - prompt_template renders the single user message fed to jiuwenswarm's CLI via
+#   stdin. jiuwenswarm is a black-box agent with its own react loop and tools, so
+#   the prompt sets the task + constraints (repo path, issue, verify, no tests/
+#   commits) rather than instructing specific tool usage. Only direct metadata
+#   fields ({problem_statement}, {language}) may be referenced.
+- name: swe_rebench
+  sandbox:
+    provider: openyuanrong
+    runtime_timeout: 7200
+    image_map:
+      - from: "swerebench/sweb.eval.x86_64.**"
+        to: "swr.cn-east-3.myhuaweicloud.com/openyuanrong/swe-rebench/**:latest"
+    sandbox_kwargs:
+      proxy_port: 38197
+      mounts:
+        - target: /opt/jiuwenswarm
+          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:latest
+  agent:
+    name: jiuwenswarm
+    run_timeout: 7200
+    conda_env: testbed
+    tool_script: /opt/jiuwenswarm/bin/run_agent.sh
+  prompt_template: &swe_jiuwenswarm_prompt
+    - role: user
+      content: |-
+        You are a senior software engineer fixing a bug in the repository at /testbed.
+
+        <issue_description>
+        {problem_statement}
+        </issue_description>
+
+        The repository is already checked out at /testbed with its development environment fully set up (all dependencies installed). Any failing tests described in the issue have already been added by us — do NOT modify, remove, or add to any existing test files. Your task is to make the minimal changes to non-test source files in /testbed so the issue is resolved.
+
+        Work through the problem like this:
+        1. Explore the codebase with efficient searches to locate and understand the code relevant to the issue; identify the likely root cause.
+        2. Reproduce the bug with a small script (e.g. /testbed/reproduce_issue.py) and run it to confirm the failing behavior before changing anything.
+        3. Implement the minimal, idiomatic fix for the root cause. Consider alternative approaches and pick the one that is correct and least invasive.
+        4. Verify: rerun your reproduction script to confirm the bug is gone, then run the relevant unit tests (e.g. with pytest) to ensure the fix is correct and introduces no regressions.
+        5. When the relevant tests pass and the issue is resolved, finish by briefly summarizing the root cause and the changes you made.
+
+        Constraints:
+        - Do NOT commit changes.
+        - Do NOT install or modify packages; use the environment as-is.
+        - Do NOT modify any existing test files.
+        - Make only the minimal changes needed to fix the issue.
+
+- name: swe_bench
+  sandbox:
+    provider: openyuanrong
+    runtime_timeout: 7200
+    image_map:
+      - from: "swebench/**"
+        to: "swr.cn-east-3.myhuaweicloud.com/openyuanrong/swe-bench-verified/**:v2"
+    sandbox_kwargs:
+      proxy_port: 38197
+      mounts:
+        - target: /opt/jiuwenswarm
+          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:latest
+  agent:
+    name: jiuwenswarm
+    run_timeout: 7200
+    conda_env: testbed
+    tool_script: /opt/jiuwenswarm/bin/run_agent.sh
+  prompt_template: *swe_jiuwenswarm_prompt
