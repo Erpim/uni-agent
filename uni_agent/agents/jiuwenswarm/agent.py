@@ -73,10 +73,10 @@ def parse_agent_result(stdout: str, exit_code: int) -> dict[str, Any]:
     we inject ``exit_status`` from ``ok``.
     """
     if exit_code == -1:
-        return {"exit_status": "timeout", "ok": False, "content": "", "error": "agent process timed out"}
+        return {"exit_status": "timeout", "content": "", "error": "agent process timed out"}
     stdout = stdout.strip()
     if not stdout:
-        return {"exit_status": "error", "ok": False, "content": "", "error": "empty stdout"}
+        return {"exit_status": "error", "content": "", "error": "empty stdout"}
     for line in reversed([ln.strip() for ln in stdout.split("\n") if ln.strip()]):
         if line.startswith("{"):
             try:
@@ -93,7 +93,7 @@ def parse_agent_result(stdout: str, exit_code: int) -> dict[str, Any]:
             return parsed
     except json.JSONDecodeError:
         logger.warning("jiuwenswarm: failed to parse agent result (stdout tail): %.1000s", stdout)
-    return {"exit_status": "error", "ok": False, "content": "", "error": "unparseable stdout"}
+    return {"exit_status": "error", "content": "", "error": "unparseable stdout"}
 
 
 class JiuwenswarmConfig(AgentConfig):
@@ -162,11 +162,8 @@ class JiuwenswarmAgent(Agent):
                 "exit_status": agent_info.get("exit_status"),
                 "ok": agent_info.get("ok"),
             },
-            # finished = ok == true: the jiuwenswarm CLI completed normally
-            # and produced a valid result. Anything else (error, timeout) is
-            # "not finished", so those episodes can be masked from the loss
-            # via mask_unfinished_episode=True in the framework config.
-            finished=agent_info.get("ok") is True,
+            # CLI produced valid JSON (has "ok") → trajectory is complete
+            finished="ok" in agent_info and result.exit_code != -1,
         )
 
     @staticmethod

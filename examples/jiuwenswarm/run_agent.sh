@@ -5,7 +5,8 @@
 # configures the jiuwenswarm gateway to point at the reverse-tunneled policy
 # endpoint (JWS_API_BASE), launches jiuwenswarm-app if needed, runs the
 # jiuwenswarm CLI in code.normal mode against the project dir, and passes the
-# CLI's --json output straight through to stdout.
+# CLI's --json output through to stdout (always exiting 0 — the sandbox masks
+# non-zero exits to 127 and drops stdout).
 #
 # Env vars (set by the host agent's build_agent_command):
 #   JWS_API_BASE      — gateway URL (http://127.0.0.1:<proxy_port>/sessions/.../v1)
@@ -41,7 +42,7 @@ mkdir -p "$JWS_WS/logs"
 
 # Write .env for jiuwenswarm-app
 cat > "$ENV_FILE" <<EOF
-MODEL_PROVIDER=OpenAI
+MODEL_PROVIDER=Anthropic
 API_BASE=${JWS_API_BASE}
 MODEL_NAME=${JWS_MODEL_NAME:-openai/default}
 API_KEY=${JWS_API_KEY:-EMPTY}
@@ -60,6 +61,15 @@ if ! (exec 3<>"/dev/tcp/127.0.0.1/$GATEWAY_PORT") 2>/dev/null; then
   done
 fi
 
-# Run CLI — --json output passes straight through to stdout
-printf '%s' "$TASK" | jiuwenswarm --mode code.normal --json \
-  --cwd "$PROJECT_DIR" --trusted-dir "$PROJECT_DIR"
+# Run CLI — pass through its --json output when it carries "ok"; otherwise emit a
+# minimal failure JSON so stdout always carries exactly one result. Always exit 0
+# (a non-zero exit would be masked to 127 and stdout dropped).
+CLI_OUT="$(printf '%s' "$TASK" | jiuwenswarm --mode code.normal --json \
+  --cwd "$PROJECT_DIR" --trusted-dir "$PROJECT_DIR")"
+CLI_RC=$?
+if printf '%s' "$CLI_OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "ok" in d' 2>/dev/null; then
+  printf '%s\n' "$CLI_OUT"
+else
+  printf '%s\n' "{\"exit_status\": \"error\", \"content\": \"\", \"error\": \"CLI failed rc=${CLI_RC}\"}"
+fi
+exit 0

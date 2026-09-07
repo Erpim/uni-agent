@@ -15,11 +15,12 @@
 # The openjiuwen dependency is a git dep from gitcode.com, so the builder
 # stage needs git + network access.
 
-FROM debian:bullseye-slim AS builder
+FROM debian:bookworm-slim AS builder
 
 ARG PBS_RELEASE="20260602"
 ARG PBS_PYTHON="3.12.13"
 ARG PIP_INDEX_URL=""
+ARG WORKSWARM_VERSION="0.2.6"
 
 # Install git + build deps for openjiuwen (git dependency from gitcode.com)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -37,7 +38,7 @@ RUN wget -q \
 # Install workswarm (jiuwenswarm) + all dependencies (incl. openjiuwen from git)
 RUN /opt/jiuwenswarm/bin/pip install --no-cache-dir \
     ${PIP_INDEX_URL:+-i ${PIP_INDEX_URL}} \
-    "workswarm==0.2.5"
+    "workswarm==${WORKSWARM_VERSION}"
 
 # Copy the in-sandbox runner script
 COPY run_agent.sh /opt/jiuwenswarm/bin/run_agent.sh

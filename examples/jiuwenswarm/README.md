@@ -1,7 +1,7 @@
 # jiuwenswarm Blackbox Sidecar Integration
 
 Integrates the [jiuwenswarm](https://gitcode.com/openJiuwen/jiuwenswarm) agent
-(PyPI: `workswarm==0.2.5`) into uni-agent as a sidecar tool image for SWE-bench
+(PyPI: `workswarm==0.2.6`) into uni-agent as a sidecar tool image for SWE-bench
 code repair tasks.
 
 ## Architecture

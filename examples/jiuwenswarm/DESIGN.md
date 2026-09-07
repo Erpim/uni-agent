@@ -7,7 +7,7 @@
 
 ## 1. 背景与目标
 
-把华为 JiuWenSwarm（下称 jiuwenswarm，PyPI 包名 `workswarm`，版本 `0.2.5`）接入 uni-agent，
+把华为 JiuWenSwarm（下称 jiuwenswarm，PyPI 包名 `workswarm`，版本 `0.2.6`）接入 uni-agent，
 作为 **SWE-bench 风格代码修复** 任务的 agent。复用 mini_swe_agent 的 **sidecar tool 镜像 + 宿主机 agent**
 模式：agent 运行时（jiuwenswarm 及其依赖）打进一个 `FROM scratch` 的 tool 镜像，通过
 `openyuanrong` 沙箱的 `mounts` 挂载进去；策略（LLM）经反向隧道在沙箱内访问。
@@ -124,13 +124,14 @@ flowchart TB
 
 ### 5.2 `Dockerfile.jiuwenswarm-tool`
 
-- **builder 阶段**：`debian:bullseye-slim`；下载 python-build-standalone（3.12，同 mini_swe_agent 的
+- **builder 阶段**：`debian:bookworm-slim`；下载 python-build-standalone（3.12，同 mini_swe_agent 的
   `20260602` 发布版）解压到 `/opt/jiuwenswarm`。
-- **安装依赖**：`/opt/jiuwenswarm/bin/pip install --no-cache-dir ${PIP_INDEX_URL:+-i ${PIP_INDEX_URL}} workswarm==0.2.5`。
+- **安装依赖**：`/opt/jiuwenswarm/bin/pip install --no-cache-dir ${PIP_INDEX_URL:+-i ${PIP_INDEX_URL}} workswarm==${WORKSWARM_VERSION}`
+  （`ARG WORKSWARM_VERSION="0.2.6"`）。
   - ⚠️ `workswarm` 依赖 `openjiuwen`（`git+https://gitcode.com/openJiuwen/agent-core.git@develop`），
     **构建期需要 git + 访问 gitcode.com 的网络**。
   - 全量依赖（chromadb、faiss-cpu、playwright pip 包、各 IM SDK 等）一并安装。
-  - playwright 浏览器二进制**默认不装**（`ARG PLAYWRIGHT_INSTALL_BROWSER=0`，为 1 时执行 `playwright install chromium`）。
+  - playwright 浏览器二进制**不装**：pip 包随依赖装上，但 Dockerfile 里没有 `playwright install` 步骤。
 - **拷贝入口**：`COPY run_agent.sh /opt/jiuwenswarm/bin/run_agent.sh`。
 - **final 阶段**：`FROM scratch`，`COPY --from=builder /opt/jiuwenswarm /`。
 - 挂载约定：`akernel_sdk.Mount(target="/opt/jiuwenswarm")` → 沙箱内路径 `/opt/jiuwenswarm/bin/run_agent.sh`。

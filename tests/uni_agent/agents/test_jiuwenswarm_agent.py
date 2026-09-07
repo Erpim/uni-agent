@@ -99,12 +99,12 @@ def test_build_agent_command_honors_overrides():
 
 def test_parse_agent_result_timeout():
     assert parse_agent_result("", -1) == {
-        "exit_status": "timeout", "ok": False, "content": "", "error": "agent process timed out"
+        "exit_status": "timeout", "content": "", "error": "agent process timed out"
     }
 
 
 def test_parse_agent_result_empty_is_error():
-    assert parse_agent_result("", 0) == {"exit_status": "error", "ok": False, "content": "", "error": "empty stdout"}
+    assert parse_agent_result("", 0) == {"exit_status": "error", "content": "", "error": "empty stdout"}
 
 
 def test_parse_agent_result_injects_exit_status_from_ok():
@@ -123,7 +123,7 @@ def test_parse_agent_result_picks_last_json_line_ignoring_noise():
 
 def test_parse_agent_result_unparseable_is_error():
     assert parse_agent_result("totally not json", 0) == {
-        "exit_status": "error", "ok": False, "content": "", "error": "unparseable stdout"
+        "exit_status": "error", "content": "", "error": "unparseable stdout"
     }
 
 
@@ -182,12 +182,21 @@ def test_run_pipes_task_and_parses_stdout_into_result():
     assert result.transcript == messages
 
 
-def test_run_marks_unfinished_when_not_ok():
-    sandbox = _FakeSandbox(stdout=json.dumps({"ok": False, "error": "connection failed"}))
+def test_run_marks_finished_when_content_present():
+    sandbox = _FakeSandbox(stdout=json.dumps({"ok": False, "content": "some work done", "error": "task failed"}))
+    agent = _agent()
+    result = asyncio.run(agent.run(sandbox=sandbox, messages=[{"role": "user", "content": "task"}]))
+    assert result.finished is True
+    assert result.info["ok"] is False
+    assert result.info["exit_status"] == "error"
+
+
+def test_run_marks_unfinished_no_ok_in_json():
+    sandbox = _FakeSandbox(stdout=json.dumps({"exit_status": "error", "content": "", "error": "CLI crashed"}))
     agent = _agent()
     result = asyncio.run(agent.run(sandbox=sandbox, messages=[{"role": "user", "content": "task"}]))
     assert result.finished is False
-    assert result.info["ok"] is False
+    assert result.info["ok"] is None
     assert result.info["exit_status"] == "error"
 
 
