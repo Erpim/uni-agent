@@ -37,7 +37,7 @@
       proxy_port: 38197
       mounts:
         - target: /opt/jiuwenswarm
-          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:latest
+          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:test-0904
   agent:
     name: jiuwenswarm
     run_timeout: 7200
@@ -46,26 +46,39 @@
   prompt_template: &swe_jiuwenswarm_prompt
     - role: user
       content: |-
-        You are a senior software engineer fixing a bug in the repository at /testbed.
+        I have uploaded a code repository at /testbed with its development environment
+        fully set up (all dependencies installed). I have already taken care of all test
+        file changes related to the issue — you do NOT need to modify any tests. Consider
+        the following issue description:
 
         <issue_description>
         {problem_statement}
         </issue_description>
 
-        The repository is already checked out at /testbed with its development environment fully set up (all dependencies installed). Any failing tests described in the issue have already been added by us — do NOT modify, remove, or add to any existing test files. Your task is to make the minimal changes to non-test source files in /testbed so the issue is resolved.
+        Implement the minimal changes to non-test files in /testbed that fix the issue.
+        Follow these steps:
+        1. Explore the codebase to locate and understand the code relevant to the issue.
+        2. Reproduce the bug with a small script (e.g. /testbed/reproduce_issue.py) and
+           confirm it fails. The script should also assert the expected behavior after
+           the fix.
+        3. Identify the root cause and choose the most correct, minimal fix among the
+           approaches you consider.
+        4. Implement the fix in the relevant non-test files.
+        5. Rerun the reproduction script and confirm it passes; iterate if needed.
+        6. Test edge cases in a separate file (e.g. /testbed/edge_case_tests.py), adding
+           and running several rounds of cases until the fix is robust and no existing
+           behavior regresses.
+        7. Run the relevant unit tests using the repository's own test runner to confirm
+           the fix introduces no regressions.
+        8. When the checks above pass, stop and summarize the root cause and the change.
 
-        Work through the problem like this:
-        1. Explore the codebase with efficient searches to locate and understand the code relevant to the issue; identify the likely root cause.
-        2. Reproduce the bug with a small script (e.g. /testbed/reproduce_issue.py) and run it to confirm the failing behavior before changing anything.
-        3. Implement the minimal, idiomatic fix for the root cause. Consider alternative approaches and pick the one that is correct and least invasive.
-        4. Verify: rerun your reproduction script to confirm the bug is gone, then run the relevant unit tests (e.g. with pytest) to ensure the fix is correct and introduces no regressions.
-        5. When the relevant tests pass and the issue is resolved, finish by briefly summarizing the root cause and the changes you made.
-
-        Constraints:
-        - Do NOT commit changes.
+        Boundaries:
+        - Do NOT modify or add test files, and do NOT commit changes.
         - Do NOT install or modify packages; use the environment as-is.
-        - Do NOT modify any existing test files.
-        - Make only the minimal changes needed to fix the issue.
+        - Touch only the non-test source files needed for the fix.
+
+        Success: the issue no longer occurs, existing tests still pass, and the change is
+        minimal and general.
 
 - name: swe_bench
   sandbox:
@@ -78,7 +91,7 @@
       proxy_port: 38197
       mounts:
         - target: /opt/jiuwenswarm
-          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:latest
+          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:test-0904
   agent:
     name: jiuwenswarm
     run_timeout: 7200
