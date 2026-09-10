@@ -4,7 +4,7 @@
 # workswarm (jiuwenswarm) + all dependencies. When mounted into a sandbox
 # at /opt/jiuwenswarm, the agent can be invoked via:
 #
-#   bash /opt/jiuwenswarm/bin/run_agent.sh <task_config.json>
+#   bash /opt/jiuwenswarm/bin/run_agent.sh   # prompt from stdin, config from env
 #
 # Uses python-build-standalone for maximum portability across different
 # glibc versions (built against older glibc, forward-compatible).
@@ -17,6 +17,9 @@
 
 FROM debian:bullseye-slim AS builder
 
+# Use a fast apt mirror for slow/domestic networks
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
+
 ARG PBS_RELEASE="20260602"
 ARG PBS_PYTHON="3.12.13"
 ARG PIP_INDEX_URL=""
@@ -26,9 +29,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates wget git \
     && rm -rf /var/lib/apt/lists/*
 
-# Download and extract python-build-standalone (stripped, 32MB)
+# Download and extract python-build-standalone (stripped, 32MB).
+# github.com is often unreachable on domestic networks; use the NJU mirror.
 RUN wget -q \
-    "https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE}/cpython-${PBS_PYTHON}%2B${PBS_RELEASE}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz" \
+    "https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone/${PBS_RELEASE}/cpython-${PBS_PYTHON}%2B${PBS_RELEASE}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz" \
     -O /tmp/python.tar.gz \
     && mkdir -p /opt/jiuwenswarm \
     && tar -xzf /tmp/python.tar.gz -C /opt/jiuwenswarm --strip-components=1 \

@@ -1,0 +1,27 @@
+FROM debian:trixie-slim AS builder
+
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources
+
+ARG PBS_RELEASE="20260602"
+ARG PBS_PYTHON="3.12.13"
+ARG PIP_INDEX_URL=""
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates wget git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN wget -q \
+    "https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone/${PBS_RELEASE}/cpython-${PBS_PYTHON}%2B${PBS_RELEASE}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz" \
+    -O /tmp/python.tar.gz \
+    && mkdir -p /opt/jiuwenswarm \
+    && tar -xzf /tmp/python.tar.gz -C /opt/jiuwenswarm --strip-components=1 \
+    && rm /tmp/python.tar.gz
+
+RUN /opt/jiuwenswarm/bin/pip install --no-cache-dir \
+    ${PIP_INDEX_URL:+-i ${PIP_INDEX_URL}} \
+    "jiuwenswarm==0.2.0"
+
+COPY run_agent_0.2.0.sh /opt/jiuwenswarm/bin/run_agent.sh
+
+FROM scratch
+COPY --from=builder /opt/jiuwenswarm /

@@ -37,7 +37,7 @@
       proxy_port: 38197
       mounts:
         - target: /opt/jiuwenswarm
-          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:test-0904
+          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:test-0913-0.2.0
   agent:
     name: jiuwenswarm
     run_timeout: 7200
@@ -91,7 +91,7 @@
       proxy_port: 38197
       mounts:
         - target: /opt/jiuwenswarm
-          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:test-0904
+          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:test-0913-0.2.0
   agent:
     name: jiuwenswarm
     run_timeout: 7200

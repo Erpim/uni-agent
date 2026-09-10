@@ -1,0 +1,23 @@
+# Upgrade workswarm on top of the working anthropic-fix-0902 image.
+# Keeps anthropic pinned at 0.125.0 (httpx2 compat).
+
+FROM swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:anthropic-fix-0902 AS base
+
+FROM debian:bullseye-slim AS builder
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget git && rm -rf /var/lib/apt/lists/*
+
+# Copy the old image's python runtime into the builder
+COPY --from=base / /opt/jiuwenswarm
+
+# Install the new whl, pin anthropic to 0.125.0
+ARG PIP_INDEX_URL=""
+COPY workswarm-0.2.5b1-py3-none-any.whl /tmp/workswarm-0.2.5b1-py3-none-any.whl
+RUN /opt/jiuwenswarm/bin/pip install --no-cache-dir ${PIP_INDEX_URL:+-i ${PIP_INDEX_URL}} /tmp/workswarm-0.2.5b1-py3-none-any.whl
+RUN /opt/jiuwenswarm/bin/pip install --no-cache-dir ${PIP_INDEX_URL:+-i ${PIP_INDEX_URL}} "anthropic==0.125.0"
+
+# Copy the updated run_agent.sh
+COPY run_agent.sh /opt/jiuwenswarm/bin/run_agent.sh
+
+FROM scratch
+COPY --from=builder /opt/jiuwenswarm /
