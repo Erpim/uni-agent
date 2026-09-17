@@ -148,6 +148,36 @@ One session may contain multiple model turns. Tool observations are encoded as c
 
 Concurrent requests may create multiple chains within one session. Chains sharing a message prefix reuse the same encoded context where possible, then materialize as separate trajectories during finalization.
 
+When a transport retry resends an identical request while the original request
+is still in flight, `coalesce_reserved_exact_requests` makes the retry await the
+original request by default. The owner response is returned
+to all waiters, so the backend generation and trajectory commit happen once.
+If the owner fails or is cancelled, the same failure is delivered to its
+waiters and the coordination state is cleared so a later retry can try again.
+The fingerprint is computed from the provider-normalized `messages`, `tools`,
+and `sampling_params` fields; differences in any of these fields are treated as
+different requests. JSON object key order and wire-format whitespace do not
+affect matching. Coalescing is scoped to one Gateway session and includes first
+turns and requests that start a new chain. A retry that arrives after the owner
+finishes follows normal chain selection and can generate independently; results
+are not cached for later retries. Cancelling a waiter does not cancel the owner.
+
+This policy treats identical in-flight requests as transport retries. Intentional
+concurrent sampling of identical normalized requests in the same session also
+shares one result. To retain independent samples for those requests, disable it:
+
+```yaml
+actor_rollout_ref:
+  rollout:
+    custom:
+      agent_framework:
+        coalesce_reserved_exact_requests: false
+```
+
+`rollout.n` creates separate Gateway sessions, so its samples are not coalesced
+with one another. The option name is retained for configuration compatibility;
+coalescing also applies when no existing chain is reserved.
+
 When a client rewrites only the most recent Assistant message, the Gateway rolls
 the matching chain back to the start of that Assistant turn and re-encodes the
 replacement suffix. This preserves token, mask, and rollout-log-probability
@@ -282,6 +312,11 @@ Important knobs include:
 - `enable_last_assistant_rollback`: reuses a chain when only its latest Assistant
   message is rewritten. Defaults to `true`; set it to `false` to preserve the
   previous split-on-rewrite behavior.
+- `coalesce_reserved_exact_requests`: makes exact provider-normalized requests
+  in the same session await and reuse an in-flight owner result, including
+  first-turn/new-chain requests. Defaults to `true`; set it to `false` for
+  independent concurrent sampling of identical requests. Retries arriving after
+  the owner completes are not coalesced.
 - `trajectory_postprocessor_fqn`: optional import path for a sync or async
   callable that postprocesses finalized trajectories before reward scoring.
 - `trajectory_postprocessor_kwargs`: optional keyword arguments passed to the
