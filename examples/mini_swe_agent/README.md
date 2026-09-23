@@ -66,7 +66,7 @@ After deployment, verify these two prerequisites:
 
 ### 1. verl × Uni-Agent Installation & Deployment
 
-It is recommended to select an open-source image from the verl ecosystem as the training foundation, e.g.: quay.io/ascend/verl:latest-vllm-910b-ubuntu-for-uniagent. This way, you can leverage the built-in training and inference dependencies pre-adapted, eliminating the need for adaptation from scratch. After launching a container from the image, initialize the dependencies for this recipe using the commands below:
+It is recommended to select an open-source image from the verl ecosystem as the training foundation, refer to the [Ascend image documentation](https://github.com/verl-project/verl/blob/main/docs/ascend_tutorial/zh/get_start/dockerfile_build_guidance.rst). This way, you can leverage the built-in training and inference dependencies pre-adapted, eliminating the need for adaptation from scratch. After launching a container from the image, initialize the dependencies for this recipe using the commands below:
 
 ```bash
 # Clone source code and enter working directory
