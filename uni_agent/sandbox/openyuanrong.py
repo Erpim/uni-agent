@@ -312,9 +312,13 @@ class OpenyuanrongSandbox(Sandbox):
             command = f"{path_setup}; {command}"
         # commands.run is a blocking SDK poll; run it off the event loop.
         result = await asyncio.to_thread(sb.commands.run, command, envs=env, cwd=workdir, timeout=timeout_i)
-        exit_code = int(result.exit_code)
         stdout = _to_str(getattr(result, "stdout", ""))
         stderr = _to_str(getattr(result, "stderr", ""))
+        raw_exit_code = result.exit_code
+        if raw_exit_code is None:
+            detail = getattr(result, "error_message", None) or stderr or "no diagnostic from the sandbox runtime"
+            raise RuntimeError(f"openyuanrong command failed without an exit code: {detail}")
+        exit_code = int(raw_exit_code)
         # openyuanrong_sandbox surfaces command timeouts as a result (exit_code=-1), not
         # an exception; re-raise so the shared exec() policy classifies it.
         if exit_code == -1 and "timed out" in stderr:

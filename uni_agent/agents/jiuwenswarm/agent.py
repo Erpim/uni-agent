@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import shlex
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -26,6 +27,8 @@ if TYPE_CHECKING:
     from uni_agent.sandbox import Sandbox
 
 logger = logging.getLogger(__name__)
+
+_SANDBOX_HOME = os.environ.get("JIUWENSWARM_SANDBOX_HOME", "/root")
 
 
 def build_agent_command(
@@ -57,7 +60,8 @@ def build_agent_command(
             f"{shlex.quote(str(env_dir.parent.parent / 'bin'))}:$PATH "
         )
     run_agent_env = (
-        conda_env_vars
+        f"HOME={_SANDBOX_HOME} "
+        + conda_env_vars
         + f"JWS_API_BASE={shlex.quote(gateway_url)} "
         f"JWS_MODEL_NAME={shlex.quote(model_name)} "
         f"JWS_API_KEY={shlex.quote(api_key)} "
