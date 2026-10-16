@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from uni_agent.gateway.session.codec import MessageCodec
-from uni_agent.gateway.session.types import InternalGenerationRequest, SessionHandle, Trajectory
+from uni_agent.gateway.session.types import InternalGenerationRequest, SessionHandle, Trajectory, UnsupportedMediaError
 from uni_agent.rl_insight.adapter import start_generation_span
 
 _EMPTY_PREFIX_HASH = hashlib.sha256(b"uni-agent-prefix-v1\0empty").hexdigest()
@@ -621,7 +621,7 @@ class GatewaySession:
                 self._codec.validate_incremental_media(incremental_messages)
                 appended_images, appended_videos = await self._codec.extract_multi_modal_data(incremental_messages)
                 if appended_videos:
-                    raise ValueError(
+                    raise UnsupportedMediaError(
                         "Continuous Token context merging does not currently support incremental video data"
                     )
                 runtime_token_ids = buffer.prompt_ids + buffer.response_ids

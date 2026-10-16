@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+from uni_agent.gateway.session.types import UnsupportedMediaError
 from uni_agent.gateway.utils import normalize_tool_arguments
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tokenizer.chat_template import apply_chat_template as _apply_chat_template
@@ -102,6 +103,41 @@ def initialize_generation_prompt(processing_class, **apply_chat_template_kwargs)
     if with_generation_prompt[: len(without_generation_prompt)] != without_generation_prompt:
         raise ValueError("Generation prompt is not a stable token suffix")
     return with_generation_prompt[len(without_generation_prompt) :]
+
+
+def _normalize_messages_for_continuous_tokens(
+    messages: list[dict[str, Any]], *, force_system_anchor: bool = False
+) -> list[dict[str, Any]]:
+    """Keep a leading system message before the Qwen synthetic user anchor.
+
+    ``verl`` can add a dummy user when a chat template requires one.  That
+    fallback must come after an existing system message (Qwen3.5 rejects a
+    system message that follows a user message).  Return copies so the session
+    history owned by the framework is never mutated.
+    """
+
+    # TODO: Remove this workaround once our pinned verl revision includes the upstream fix
+    # and Qwen3.5 system-only initialization and continuation are verified to preserve
+    # system ordering and the immutable Continuous Token prefix without this wrapper.
+    normalized = []
+    for message in messages:
+        copied = dict(message)
+        if isinstance(message.get("tool_calls"), list):
+            copied["tool_calls"] = list(message["tool_calls"])
+        normalized.append(copied)
+    if not force_system_anchor and any(message.get("role") == "user" for message in normalized):
+        return normalized
+    first_non_system = next(
+        (index for index, message in enumerate(normalized) if message.get("role") != "system"),
+        len(normalized),
+    )
+    if first_non_system == 0:
+        return normalized
+    return [
+        *normalized[:first_non_system],
+        {"role": "user", "content": [{"type": "text", "text": ""}]},
+        *normalized[first_non_system:],
+    ]
 
 
 class MessageCodec:
@@ -206,8 +242,6 @@ class MessageCodec:
         Custom extractors accept image_patch_size; explicit kwargs override the
         processor value. Videos may include metadata as (video, metadata) tuples.
         """
-        if self._processor is None:
-            return None, None
         has_media = any(
             isinstance(block, dict) and block.get("type") in {"image", "image_url", "video", "video_url"}
             for message in messages
@@ -216,6 +250,8 @@ class MessageCodec:
         )
         if not has_media:
             return None, None
+        if not self._continuous_token_builder.supports_multimodal():
+            raise UnsupportedMediaError("image or video content requires a multimodal processor")
 
         extractor_kwargs = dict(self._vision_info_extractor_kwargs)
         if "image_patch_size" not in extractor_kwargs:
@@ -231,7 +267,7 @@ class MessageCodec:
     ) -> list[int]:
         """Build the initial runtime token stream."""
         return self._continuous_token_builder.build_initial_tokens(
-            messages,
+            _normalize_messages_for_continuous_tokens(messages),
             tools=tools,
             images=image_data,
             videos=video_data,
@@ -270,11 +306,15 @@ class MessageCodec:
                     continue
                 media_type = block.get("type")
                 if media_type in {"video", "video_url", "audio", "audio_url", "input_audio", "output_audio"}:
-                    raise ValueError("Gateway Continuous Token does not support incremental video or audio data")
+                    raise UnsupportedMediaError(
+                        "Gateway Continuous Token does not support incremental video or audio data"
+                    )
                 if media_type in {"image", "image_url"} and not isinstance(
                     self._continuous_token_builder, VLContinuousTokenMixin
                 ):
-                    raise ValueError("Gateway incremental image inputs require a VL Continuous Token builder")
+                    raise UnsupportedMediaError(
+                        "Gateway incremental image inputs require a VL Continuous Token builder"
+                    )
 
     def merge_context_tokens(
         self,
@@ -295,7 +335,18 @@ class MessageCodec:
         The session validates appended media first; non-empty video_data is unsupported.
         """
         if video_data:
-            raise ValueError("Continuous Token context merging does not currently support incremental video data")
+            raise UnsupportedMediaError(
+                "Continuous Token context merging does not currently support incremental video data"
+            )
+        force_system_anchor = any(message.get("role") == "system" for message in previous_messages) and not any(
+            message.get("role") == "user" for message in previous_messages
+        )
+        previous_messages = _normalize_messages_for_continuous_tokens(
+            previous_messages, force_system_anchor=force_system_anchor
+        )
+        updated_messages = _normalize_messages_for_continuous_tokens(
+            updated_messages, force_system_anchor=force_system_anchor
+        )
         builder = self._continuous_token_builder
         if isinstance(builder, VLContinuousTokenMixin):
             merge_result = builder.merge_context_tokens(

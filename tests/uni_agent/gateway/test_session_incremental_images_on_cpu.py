@@ -10,7 +10,7 @@ from tests.uni_agent.support import (
     SequencedBackend,
     fake_vision_info_extractor,
 )
-from uni_agent.gateway.adapters.openai import openai_to_internal
+from uni_agent.gateway.adapters.openai_chat import openai_to_internal
 from uni_agent.gateway.session import GatewaySession, MessageCodec, SessionHandle
 from verl.utils.tokenizer.continuous_token import QwenVLContinuousTokenBuilder
 
