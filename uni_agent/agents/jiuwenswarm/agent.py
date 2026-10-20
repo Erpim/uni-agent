@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 _SANDBOX_HOME = os.environ.get("JIUWENSWARM_SANDBOX_HOME", "/root")
 
+_TURN_MARKER = '"event_type": *"context.usage"'
+_SESSIONS_GLOB = ".jiuwenswarm/agent/sessions/*/history.jsonl"
+
 
 def build_agent_command(
     *,
@@ -40,6 +43,7 @@ def build_agent_command(
     api_key: str = "EMPTY",
     project_dir: str = "/testbed",
     conda_env_path: str | None = None,
+    turn_limit: int | None = None,
 ) -> str:
     """Build the shell command that runs ``run_agent.sh`` inside the sandbox.
 
@@ -49,6 +53,11 @@ def build_agent_command(
     When ``conda_env_path`` is set, the tool bash is called through that conda
     env so jiuwenswarm's tool subprocesses resolve the repo environment inside
     the project dir.
+
+    ``turn_limit`` caps the number of LLM round trips. The CLI has no native
+    turn flag, so the episode is launched in its own session with a watchdog
+    beside it that kills that session once the limit is reached. ``None``
+    disables the watchdog and yields the plain single-line launch.
     """
     conda_env_vars = ""
     if conda_env_path:
@@ -69,11 +78,51 @@ def build_agent_command(
         "PIP_DISABLE_PIP_VERSION_CHECK=1 "
         "PIP_PROGRESS_BAR=off"
     )
-    return (
-        "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy; "
+    head = "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy; "
+    launch = (
         f"printf %s {shlex.quote(task_b64)} | base64 -d | "
         f"env {run_agent_env} bash {shlex.quote(tool_script)}"
     )
+    # `None` disables the watchdog; the narrowed `int` is what the helper takes.
+    turn_cap = int(turn_limit) if turn_limit is not None and turn_limit > 0 else None
+    if turn_cap is None:
+        return head + launch
+    return (
+        head
+        + f"setsid bash -c {shlex.quote(launch)} &\n"
+        "DSPID=$!\n"
+        + _build_turn_watchdog(turn_limit=turn_cap)
+        + "WPID=$!\n"
+        + _watchdog_wait_block()
+    )
+
+
+def _build_turn_watchdog(*, turn_limit: int) -> str:
+    """Return a backgrounded snippet that kills this episode at ``turn_limit``.
+
+    Counts ``context.usage`` records in jiuwenswarm's session history and kills
+    the launch's process group (``setsid`` put the CLI and its gateway in it).
+    """
+    sessions_glob = f"{shlex.quote(_SANDBOX_HOME)}/{_SESSIONS_GLOB}"
+    return (
+        "(\n"
+        "  while :; do\n"
+        f"    N=$(grep -ah {shlex.quote(_TURN_MARKER)} {sessions_glob} 2>/dev/null | wc -l)\n"
+        f'    if [ "${{N:-0}}" -ge {int(turn_limit)} ]; then\n'
+        '      kill -9 -- "-$DSPID" 2>/dev/null\n'
+        "      break\n"
+        "    fi\n"
+        "    sleep 0.5\n"
+        "  done\n"
+        ") &\n"
+    )
+
+
+def _watchdog_wait_block() -> str:
+    """Return the shell tail that waits on the episode and exits with its real
+    status (non-zero when the turn cap fired, so the episode is unfinished).
+    """
+    return 'wait $DSPID\nRC=$?\nkill "$WPID" 2>/dev/null\nexit $RC\n'
 
 
 def parse_agent_result(stdout: str, exit_code: int) -> dict[str, Any]:
@@ -124,6 +173,13 @@ class JiuwenswarmConfig(AgentConfig):
     tool_script: str = Field(
         description="In-sandbox entrypoint path (e.g. /opt/jiuwenswarm/bin/run_agent.sh)."
     )
+    turn_limit: int | None = Field(
+        default=100,
+        description="Max interaction turns before the episode is cut short. An in-sandbox "
+        "watchdog counts jiuwenswarm's own turn records and kills the episode at the limit; "
+        "the killed episode reports unfinished and is masked from the loss. "
+        "None = no turn cap (only run_timeout).",
+    )
 
 
 @register_agent("jiuwenswarm")
@@ -160,6 +216,7 @@ class JiuwenswarmAgent(Agent):
             api_key=cfg.model.api_key or "EMPTY",
             project_dir=project_dir,
             conda_env_path=cfg.conda_env_path,
+            turn_limit=cfg.turn_limit,
         )
         result = await sandbox.exec_shell(agent_cmd, timeout=cfg.run_timeout, workdir=project_dir)
 

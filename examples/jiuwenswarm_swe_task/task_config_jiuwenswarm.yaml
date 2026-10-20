@@ -26,6 +26,7 @@
     run_timeout: 7200
     conda_env_path: /opt/miniconda3/envs/testbed
     tool_script: /opt/jiuwenswarm/bin/run_agent.sh
+    turn_limit: 100
   prompt_template: &swe_jiuwenswarm_prompt
     - role: user
       content: |-
@@ -80,4 +81,5 @@
     run_timeout: 7200
     conda_env_path: /opt/miniconda3/envs/testbed
     tool_script: /opt/jiuwenswarm/bin/run_agent.sh
+    turn_limit: 100
   prompt_template: *swe_jiuwenswarm_prompt

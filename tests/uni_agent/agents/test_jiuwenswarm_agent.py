@@ -117,6 +117,64 @@ def test_build_agent_command_skips_conda_when_unset():
     assert "PIP_DISABLE_PIP_VERSION_CHECK=1" in cmd
 
 
+# --------------------------- turn-limit watchdog ---------------------------
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_build_agent_command_without_turn_limit_is_a_plain_launch():
+    cmd = build_agent_command(
+        task_b64=base64.b64encode(b"fix the bug").decode(),
+        tool_script=_TOOL_SCRIPT,
+        gateway_url="http://g/v1",
+        turn_limit=None,
+    )
+    assert "setsid" not in cmd
+    assert "DSPID" not in cmd
+    assert "context.usage" not in cmd
+    assert _decode_task_b64(cmd) == "fix the bug"
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_build_agent_command_with_turn_limit_adds_watchdog():
+    cmd = build_agent_command(
+        task_b64=base64.b64encode(b"fix the bug").decode(),
+        tool_script=_TOOL_SCRIPT,
+        gateway_url="http://g/v1",
+        project_dir="/testbed",
+        turn_limit=100,
+    )
+    assert "setsid bash -c" in cmd
+    assert "DSPID=$!" in cmd
+    assert 'wait $DSPID\nRC=$?\nkill "$WPID" 2>/dev/null\nexit $RC' in cmd
+    assert '"event_type": *"context.usage"' in cmd
+    assert "/root/.jiuwenswarm/agent/sessions/*/history.jsonl" in cmd
+    assert '-ge 100' in cmd
+    assert 'kill -9 -- "-$DSPID"' in cmd
+    assert _decode_task_b64(cmd) == "fix the bug"
+
+    end_turn = build_agent_command(
+        task_b64="",
+        tool_script=_TOOL_SCRIPT,
+        gateway_url="http://g/v1",
+        turn_limit=7,
+    )
+    assert "-ge 7" in end_turn
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_build_agent_command_ignores_nonpositive_turn_limit():
+    cmd = build_agent_command(
+        task_b64="",
+        tool_script=_TOOL_SCRIPT,
+        gateway_url="http://g/v1",
+        turn_limit=0,
+    )
+    assert "setsid" not in cmd
+
+
 # --------------------------- example task config ---------------------------
 
 
@@ -128,13 +186,16 @@ def test_example_task_config_builds_agent_config(task_name):
     cfg = JiuwenswarmConfig(**resolved["agent"])
 
     assert cfg.conda_env_path == "/opt/miniconda3/envs/testbed"
+    assert cfg.turn_limit == 100
     cmd = build_agent_command(
         task_b64="",
         tool_script=cfg.tool_script,
         gateway_url="http://g/v1",
         conda_env_path=cfg.conda_env_path,
+        turn_limit=cfg.turn_limit,
     )
     assert "CONDA_PREFIX=/opt/miniconda3/envs/testbed" in cmd
+    assert "-ge 100" in cmd
 
 
 # --------------------------- parse_agent_result ---------------------------
@@ -251,6 +312,22 @@ def test_run_uses_external_workdir_as_project_dir():
     asyncio.run(agent.run(sandbox=sandbox, messages=[{"role": "user", "content": "task"}], workdir="/repo"))
     cmd = sandbox.exec_shell_calls[0]
     assert "JWS_PROJECT_DIR=/repo" in cmd
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_run_caps_turns_by_default():
+    sandbox = _FakeSandbox(stdout=json.dumps({"ok": True, "content": "done"}))
+    asyncio.run(_agent().run(sandbox=sandbox, messages=[{"role": "user", "content": "task"}]))
+    assert "-ge 100" in sandbox.exec_shell_calls[0]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_run_without_turn_limit_does_not_launch_a_watchdog():
+    sandbox = _FakeSandbox(stdout=json.dumps({"ok": True, "content": "done"}))
+    asyncio.run(_agent(turn_limit=None).run(sandbox=sandbox, messages=[{"role": "user", "content": "task"}]))
+    assert "setsid" not in sandbox.exec_shell_calls[0]
 
 
 # --------------------------- unfinished-episode mask ---------------------------
