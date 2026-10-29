@@ -40,6 +40,54 @@ cd "$PROJECT_DIR"
 echo "" | jiuwenswarm-init >/dev/null 2>&1 || true
 mkdir -p "$JWS_WS/logs"
 
+# Trim the generated config (and the package template) to shrink the system prompt
+"$TOOL_BIN/python3.12" - "$JWS_WS/config/config.yaml" <<'PY' || echo "[warn] config trim failed" >&2
+import importlib.util, os, sys
+from ruamel.yaml import YAML
+
+root = os.path.dirname(importlib.util.find_spec("jiuwenswarm").origin)
+version = None
+with open(os.path.join(root, "common", "_build_config.py"), encoding="utf-8") as f:
+    for line in f:
+        if line.startswith("VERSION"):
+            version = line.split("=", 1)[1].strip().strip("'\"")
+            break
+
+def trim(cfg):
+    cfg["auto_recap"]["enabled"] = False
+    cfg["symphony"]["skill_retrieval"]["enabled"] = False
+    cfg["react"]["skill_mode"] = "auto_list"
+    cfg["react"]["enable_task_loop"] = False
+    cfg["react"]["enable_read_image_multimodal"] = False
+    cfg["react"]["subagent_runtime"]["enabled"] = False
+    subs = cfg["react"]["subagents"]
+    for name in ("statusline-setup", "general_agent", "browser_agent"):
+        subs[name]["enabled"] = False
+    subs["explore_agent"] = {"enabled": False}
+    subs["plan_agent"] = {"enabled": False}
+    cfg["modes"]["code"]["memory"]["enabled"] = False
+    cfg["modes"]["code"]["tools"] = []
+    if version:
+        cfg["config_version"] = version
+
+yaml = YAML()
+yaml.preserve_quotes = True
+yaml.default_flow_style = False
+yaml.indent(mapping=2, sequence=4, offset=2)
+yaml.width = 4096
+
+for path in (sys.argv[1], os.path.join(root, "resources", "config.yaml")):
+    if not os.path.isfile(path) or not os.access(path, os.W_OK):
+        continue
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.load(f)
+    trim(cfg)
+    tmp = path + ".trim.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        yaml.dump(cfg, f)
+    os.replace(tmp, path)
+PY
+
 # Write .env for jiuwenswarm-app
 cat > "$ENV_FILE" <<EOF
 MODEL_PROVIDER=Anthropic
