@@ -33,6 +33,7 @@ import logging
 import os
 import time
 from collections import defaultdict
+from functools import partial
 from pathlib import Path
 from uuid import uuid4
 
@@ -74,15 +75,15 @@ def _rule(text: str = "", width: int = 50, ch: str = "-") -> str:
     return f"{ch * (pad // 2)} {text} {ch * (pad - pad // 2)}"
 
 
-def _engine_kwargs_json(value: str) -> dict:
-    """Parse the selected engine's native options without changing their values."""
+def _parse_json_object(value: str, *, error_message: str | None = None) -> dict[str, object]:
+    """Parse one CLI JSON object."""
     try:
-        options = json.loads(value)
+        parsed = json.loads(value)
     except json.JSONDecodeError as exc:
-        raise argparse.ArgumentTypeError("--engine-kwargs must be a JSON object") from exc
-    if not isinstance(options, dict):
-        raise argparse.ArgumentTypeError("--engine-kwargs must be a JSON object")
-    return options
+        raise argparse.ArgumentTypeError(error_message or f"invalid JSON object: {exc.msg}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError(error_message or "expected a JSON object")
+    return parsed
 
 
 def init_config(args: argparse.Namespace, *, served_model_name: str):
@@ -167,6 +168,13 @@ def init_config(args: argparse.Namespace, *, served_model_name: str):
             )
         else:
             raise ValueError("--language-model-only is supported only with --engine vllm or sglang")
+    if (apply_chat_template_kwargs := getattr(args, "apply_chat_template_kwargs", None)) is not None:
+        OmegaConf.update(
+            config,
+            "data.apply_chat_template_kwargs",
+            dict(apply_chat_template_kwargs),
+            force_add=True,
+        )
     if getattr(args, "disable_thinking", False):
         OmegaConf.update(config, "data.apply_chat_template_kwargs.enable_thinking", False, force_add=True)
 
@@ -391,6 +399,13 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=DEFAULT_TOP_P, help="Default nucleus sampling probability.")
     parser.add_argument("--top-k", type=int, default=-1, help="Default top-k sampling (-1 disables).")
     parser.add_argument(
+        "--apply-chat-template-kwargs",
+        type=_parse_json_object,
+        default=None,
+        metavar="JSON",
+        help="JSON object assigned to data.apply_chat_template_kwargs for model-specific prompt rendering.",
+    )
+    parser.add_argument(
         "--allowed-request-sampling-param-keys",
         nargs="+",
         default=[],
@@ -439,7 +454,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--engine-kwargs",
-        type=_engine_kwargs_json,
+        type=partial(_parse_json_object, error_message="--engine-kwargs must be a JSON object"),
         default=None,
         help="JSON object of native options for the selected engine, merged after backend-specific defaults.",
     )
