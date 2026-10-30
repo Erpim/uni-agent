@@ -205,6 +205,7 @@ class GatewaySession:
         sampling_params: dict[str, Any] | None = None,
         enable_last_assistant_rollback: bool = True,
         coalesce_reserved_exact_requests: bool = True,
+        pass_through_message_history: bool = False,
         metadata: dict[str, Any] | None = None,
     ):
         """Create an active session bound to a handle and model codec."""
@@ -212,6 +213,10 @@ class GatewaySession:
             raise ValueError(f"prompt_length must be positive when set, got {prompt_length}")
         if response_length is not None and response_length <= 0:
             raise ValueError(f"response_length must be positive when set, got {response_length}")
+        if type(pass_through_message_history) is not bool:
+            raise ValueError(
+                f"pass_through_message_history must be a bool, got {type(pass_through_message_history).__name__}"
+            )
 
         self.handle = handle
         self._codec = codec
@@ -223,6 +228,10 @@ class GatewaySession:
         self._sampling_params = dict(sampling_params or {})
         self._enable_last_assistant_rollback = enable_last_assistant_rollback
         self._coalesce_reserved_exact_requests = coalesce_reserved_exact_requests
+        # Opt-in copy of the chat text into the materialized trajectory so
+        # downstream user code (a custom trajectory select function) can read it.
+        # Off by default: all/longest sessions pay nothing.
+        self._pass_through_message_history = pass_through_message_history
         self._metadata = dict(metadata or {})
         self._trace_identity = dict(self._metadata.get("_trace_identity") or {})
         self.active_chains: list[ChainState] = []
@@ -1010,6 +1019,13 @@ class GatewaySession:
         mm_processor_kwargs = self._codec.mm_processor_kwargs
         if mm_processor_kwargs:
             trajectory_extra_fields["mm_processor_kwargs"] = mm_processor_kwargs
+        # Every trajectory is built here (finalize materialization *and*
+        # length-exhausted materialization mid-generation), so hanging the copy
+        # off this single constructor keeps both paths consistent. The message
+        # dicts are shared, not deep-copied: downstream consumers must treat it
+        # as read-only. The framework owns releasing it before scoring/TQ writes.
+        if self._pass_through_message_history:
+            trajectory_extra_fields["message_history"] = list(chain.message_history)
         return Trajectory(
             prompt_ids=list(chain.buffer.prompt_ids),
             response_ids=list(chain.buffer.response_ids),

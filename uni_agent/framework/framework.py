@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
@@ -28,7 +28,7 @@ from uni_agent.rl_insight.adapter import agent_loop_session
 from uni_agent.tasks import TaskResult
 from verl.tools.tool_registry import initialize_tools_from_config
 from verl.utils import tensordict_utils as tu
-from verl.utils.import_utils import load_class_from_fqn
+from verl.utils.import_utils import load_class_from_fqn, load_extern_object
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.transferqueue_utils import tq
 
@@ -39,6 +39,79 @@ logger = logging.getLogger(__name__)
 
 
 TrajectoryPostprocessor = Callable[..., list[Trajectory] | Awaitable[list[Trajectory]]]
+TrajectorySelectFunction = Callable[[str, list[Trajectory]], list[Trajectory] | Awaitable[list[Trajectory]]]
+
+
+@dataclass(frozen=True)
+class _CustomSelectFunction:
+    """``{path, name}`` reference to a user-owned trajectory select function.
+
+    Mirrors ``reward.custom_reward_function``: ``path`` is a module reference
+    (``pkg://pkg.module`` or a plain module name) or a filesystem path to a
+    ``.py`` file (``file:///abs/path.py`` or a bare path); ``name`` is the
+    attribute holding the callable. The two-part split keeps module and
+    attribute resolution unambiguous (a path may itself contain dots).
+    """
+
+    path: str
+    name: str
+
+
+def _parse_trajectory_selection(
+    runner_name: object,
+    runner_cfg,
+) -> tuple[str, _CustomSelectFunction | None]:
+    """Decode ``agent_runners.<name>.trajectory_selection`` into (selection, custom).
+
+    Two type-disjoint forms are accepted: a string (``all`` / ``longest``, the
+    historical form) or a mapping holding ``custom_select_function.{path, name}``.
+    The mapping form normalises to the internal marker ``"custom"``; that marker
+    is never a user-facing value and no logic keys off it (callers check
+    ``custom_select_function is not None`` instead).
+    """
+    # A top-level custom_select_function is silently ignored by the old
+    # all/longest path, which would look like "my selector ran but did nothing".
+    # Refuse it at start-up instead.
+    if "custom_select_function" in runner_cfg:
+        raise ValueError(
+            f"agent_runners.{runner_name}: 'custom_select_function' must be nested under "
+            "'trajectory_selection' (mapping form), not a top-level runner key"
+        )
+
+    raw = runner_cfg.get("trajectory_selection", "all")
+    if isinstance(raw, str):
+        return raw, None
+    if isinstance(raw, Mapping):
+        csf = OmegaConf.to_container(OmegaConf.create(raw.get("custom_select_function", {})), resolve=True) or {}
+        if not isinstance(csf, Mapping):
+            raise ValueError(
+                f"agent_runners.{runner_name}: trajectory_selection.custom_select_function must be a mapping, "
+                f"got {type(csf).__name__}"
+            )
+        return "custom", _CustomSelectFunction(
+            path=str(csf.get("path") or ""),
+            name=str(csf.get("name") or ""),
+        )
+    raise ValueError(
+        f"agent_runners.{runner_name}: trajectory_selection must be 'all'/'longest' or a mapping with "
+        f"custom_select_function.{{path, name}}, got {type(raw).__name__}"
+    )
+
+
+def _load_select_function(custom: _CustomSelectFunction) -> TrajectorySelectFunction:
+    """Resolve a ``{path, name}`` reference to a callable (fail-fast at start-up).
+
+    Loading mirrors ``reward.custom_reward_function`` so both share one pattern:
+    ``pkg://pkg.module`` / a plain module name / ``file:///abs/x.py`` / a bare
+    ``.py`` path all resolve through ``load_extern_object``.
+    """
+    try:
+        fn = load_extern_object(module_path=custom.path, object_name=custom.name)
+    except Exception as exc:
+        raise ValueError(f"cannot load select function {custom.path}.{custom.name}: {exc}") from exc
+    if not callable(fn):
+        raise TypeError(f"select function {custom.path}.{custom.name} is not callable")
+    return fn
 
 
 @dataclass
@@ -48,6 +121,7 @@ class _RunnerConfig:
     dispatch_mode: str
     max_concurrent_sessions: int
     trajectory_selection: str = "all"
+    custom_select_function: _CustomSelectFunction | None = None
     session_timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
@@ -57,7 +131,17 @@ class _RunnerConfig:
             raise ValueError(f"Unknown dispatch mode: {self.dispatch_mode}")
         if self.max_concurrent_sessions < 0:
             raise ValueError(f"max_concurrent_sessions must be non-negative, got {self.max_concurrent_sessions}")
-        if self.trajectory_selection not in {"all", "longest"}:
+        if self.custom_select_function is not None:
+            # "custom" is the internal marker for the mapping form; users never
+            # spell it, and a stale string/mapping mix is a misconfiguration.
+            if self.trajectory_selection != "custom":
+                raise ValueError(
+                    f"custom_select_function requires trajectory_selection='custom' internally, "
+                    f"got {self.trajectory_selection!r}"
+                )
+            if not self.custom_select_function.path or not self.custom_select_function.name:
+                raise ValueError("custom_select_function requires non-empty 'path' and 'name'")
+        elif self.trajectory_selection not in {"all", "longest"}:
             raise ValueError(f"Unknown trajectory selection: {self.trajectory_selection}. Expected 'all' or 'longest'")
         if self.session_timeout_seconds is not None and self.session_timeout_seconds <= 0:
             raise ValueError(f"session_timeout_seconds must be positive, got {self.session_timeout_seconds}")
@@ -78,7 +162,7 @@ class _RunnerConfig:
             runner_kwargs["tool_config"] = tool_config
         dispatch_mode = str(runner_cfg.get("dispatch_mode", "inline_async"))
         max_concurrent_sessions = int(runner_cfg.get("max_concurrent_sessions", 0) or 0)
-        trajectory_selection = str(runner_cfg.get("trajectory_selection", "all"))
+        trajectory_selection, custom_select_function = _parse_trajectory_selection(runner_name, runner_cfg)
         raw_timeout = runner_cfg.get("session_timeout_seconds")
         session_timeout_seconds = None if raw_timeout is None else float(raw_timeout)
         try:
@@ -88,6 +172,7 @@ class _RunnerConfig:
                 dispatch_mode=dispatch_mode,
                 max_concurrent_sessions=max_concurrent_sessions,
                 trajectory_selection=trajectory_selection,
+                custom_select_function=custom_select_function,
                 session_timeout_seconds=session_timeout_seconds,
             )
         except ValueError as exc:
@@ -144,30 +229,94 @@ def _select_session_trajectories(
     session_id: str,
     trajectories: list[Trajectory],
     selection: str,
-) -> list[Trajectory]:
-    """Apply the runner's trajectory-retention policy before scoring and TQ writes."""
-    if selection == "all" or len(trajectories) <= 1:
-        return trajectories
+    *,
+    select_fn: TrajectorySelectFunction | None = None,
+) -> list[Trajectory] | Awaitable[list[Trajectory]]:
+    """Apply the runner's trajectory-retention policy before scoring and TQ writes.
 
-    index, trajectory = max(
-        enumerate(trajectories),
-        key=lambda item: (
-            sum(item[1].response_mask),
-            len(item[1].response_ids),
-            item[1].num_turns,
-            item[0],
-        ),
-    )
-    logger.info(
-        "session %s: selected longest trajectory index=%s model_tokens=%s response_tokens=%s turns=%s candidates=%s",
-        session_id,
-        index,
-        sum(trajectory.response_mask),
-        len(trajectory.response_ids),
-        trajectory.num_turns,
-        len(trajectories),
-    )
-    return [trajectory]
+    ``all``/``longest`` keep their historical behaviour (including the
+    single-trajectory short-circuit). ``custom`` delegates the whole decision to
+    the user's ``select_fn``; the awaiting caller resolves the coroutine case.
+    """
+    if select_fn is None:
+        if selection == "all" or len(trajectories) <= 1:
+            return trajectories
+
+        index, trajectory = max(
+            enumerate(trajectories),
+            key=lambda item: (
+                sum(item[1].response_mask),
+                len(item[1].response_ids),
+                item[1].num_turns,
+                item[0],
+            ),
+        )
+        logger.info(
+            "session %s: selected longest trajectory index=%s model_tokens=%s "
+            "response_tokens=%s turns=%s candidates=%s",
+            session_id,
+            index,
+            sum(trajectory.response_mask),
+            len(trajectory.response_ids),
+            trajectory.num_turns,
+            len(trajectories),
+        )
+        return [trajectory]
+
+    # Custom mode deliberately skips the len<=1 short-circuit above: a single
+    # trajectory can still be the one the user wants dropped (e.g. a title-only
+    # session). The decision, and the empty result, are the user's.
+    kept: list[Trajectory] | Awaitable[list[Trajectory]]
+    try:
+        kept = select_fn(session_id, trajectories)
+    except Exception:
+        logger.exception("session %s: custom select raised; falling back to 'all'", session_id)
+        kept = trajectories
+
+    if inspect.isawaitable(kept):
+        return _await_custom_select_and_release(session_id, trajectories, kept)
+    return _finalize_custom_select(session_id, trajectories, kept)
+
+
+async def _await_custom_select_and_release(
+    session_id: str,
+    trajectories: list[Trajectory],
+    awaitable: Awaitable[list[Trajectory]],
+) -> list[Trajectory]:
+    """Await an async select function, then apply the same release/validation tail."""
+    try:
+        kept = await awaitable
+    except Exception:
+        logger.exception("session %s: custom select raised; falling back to 'all'", session_id)
+        kept = trajectories
+    return _finalize_custom_select(session_id, trajectories, kept)
+
+
+def _finalize_custom_select(
+    session_id: str,
+    trajectories: list[Trajectory],
+    kept: list[Trajectory],
+) -> list[Trajectory]:
+    """Normalise the user's return value, release message text, and log the outcome."""
+    if not isinstance(kept, list):
+        kept = list(kept)
+
+    # Single release point for the whole session, discarded trajectories
+    # included: it happens before reward scoring, the reward-info rewrite (which
+    # copies extra_fields into a fresh dict), artifact logging and the TQ write,
+    # so message text reaches none of them. ``kept`` is a subset of
+    # ``trajectories``, so one pass covers it too. A configured
+    # trajectory_postprocessor therefore cannot read message_history anymore;
+    # move the release later (and re-check those consumers) if that is ever
+    # needed.
+    for trajectory in trajectories:
+        trajectory.extra_fields.pop("message_history", None)
+
+    if not kept:
+        logger.warning("session %s: custom select returned no trajectories -> status=empty", session_id)
+    else:
+        logger.info("session %s: custom select kept=%s/%s", session_id, len(kept), len(trajectories))
+    return kept
 
 
 _TQ_NESTED_SEQUENCE_FIELDS = {
@@ -361,6 +510,28 @@ class GatewayAgentFramework(AgentFramework):
         self._mask_unfinished_episode = mask_unfinished_episode
         self._trajectory_postprocessor = trajectory_postprocessor
         self._trajectory_postprocessor_kwargs = trajectory_postprocessor_kwargs or {}
+        # Resolve every custom select function up front so a bad reference fails
+        # at start-up instead of on the first session, and so each runner keeps
+        # its own function (multi-agent deployments can mix selectors freely).
+        self._select_functions: dict[str, TrajectorySelectFunction] = {}
+        for runner_name, runner_config in runner_registry.items():
+            if runner_config.custom_select_function is None:
+                continue
+            try:
+                self._select_functions[runner_name] = _load_select_function(runner_config.custom_select_function)
+            except TypeError as exc:
+                raise TypeError(f"agent_runners.{runner_name}: {exc}") from exc
+            except ValueError as exc:
+                raise ValueError(f"agent_runners.{runner_name}: {exc}") from exc
+
+    def _select_fn_for(self, runner_name: str, runner_config: _RunnerConfig) -> TrajectorySelectFunction | None:
+        """Return the preloaded select function for this runner, if it configured one."""
+        if runner_config.custom_select_function is None:
+            return None
+        try:
+            return self._select_functions[runner_name]
+        except KeyError as exc:
+            raise ValueError(f"agent_runners.{runner_name}: custom select function was not preloaded") from exc
 
     @classmethod
     def from_config(
@@ -795,11 +966,17 @@ class GatewayAgentFramework(AgentFramework):
         tools_kwargs = sample_fields.get("tools_kwargs")
         tools_kwargs = dict(tools_kwargs or {})
         tools_kwargs["_trace_identity"] = trace_identity
+        # Only custom selection needs the raw message text; the gateway copies it
+        # at materialization time so the select function can read it. all/longest
+        # keep the historical zero-copy path.
+        pass_through_message_history = runner_config.custom_select_function is not None
+        select_fn = self._select_fn_for(runner_name, runner_config)
         async with _log_scope(parent_log):
             session = await self.gateway_manager.create_session(
                 session_id,
                 metadata={"_trace_identity": trace_identity},
                 sampling_params=dict(sampling_params),
+                pass_through_message_history=pass_through_message_history,
             )
             logger.info(
                 "session %s start: runner=%s sample_index=%s session_index=%s global_steps=%s",
@@ -858,7 +1035,10 @@ class GatewayAgentFramework(AgentFramework):
                     session_id,
                     session_trajectories,
                     runner_config.trajectory_selection,
+                    select_fn=select_fn,
                 )
+                if inspect.isawaitable(session_trajectories):
+                    session_trajectories = await session_trajectories
             except asyncio.CancelledError:
                 # Parent shutdown/cancellation must not leave the Gateway route
                 # and actor-owned session live after the runner task is gone.

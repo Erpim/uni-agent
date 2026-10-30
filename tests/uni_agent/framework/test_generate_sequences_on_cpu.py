@@ -20,7 +20,21 @@ from verl.utils import tensordict_utils as tu
 _RUNNER_CALLS = []
 _TEST_INLINE_RUNNERS = {}
 _POSTPROCESSOR_CALLS = []
+_SELECT_CALLS = []
 _NOT_CALLABLE_POSTPROCESSOR = 42
+
+#: Importable module used as the {path, name} source for custom select tests.
+_SELECT_FIXTURES_MODULE = "tests.uni_agent.framework.select_fixtures"
+
+
+def _select_config(name: str) -> dict[str, object]:
+    """Build the mapping form of trajectory_selection pointing at a fixture."""
+    return {
+        "custom_select_function": {
+            "path": f"pkg://{_SELECT_FIXTURES_MODULE}",
+            "name": name,
+        }
+    }
 
 
 def _recording_trajectory_postprocessor(trajectories, *, task_result, policy=None):
@@ -105,7 +119,8 @@ def _inline_runner_config(
     runner,
     *,
     dispatch_mode: str = "inline_async",
-    trajectory_selection: str | None = None,
+    trajectory_selection: object | None = None,
+    extra_config: dict[str, object] | None = None,
 ) -> dict[str, object]:
     runner_key = f"runner-{len(_TEST_INLINE_RUNNERS)}"
     _TEST_INLINE_RUNNERS[runner_key] = runner
@@ -116,6 +131,8 @@ def _inline_runner_config(
     }
     if trajectory_selection is not None:
         config["trajectory_selection"] = trajectory_selection
+    if extra_config:
+        config.update(extra_config)
     return config
 
 
@@ -504,6 +521,7 @@ def _trajectory(
     num_turns: int = 2,
     routed_experts: object | None = None,
     extra_fields: dict[str, object] | None = None,
+    chain_id: int | None = None,
 ):
     prompt_ids = prompt_ids or [10, 11]
     response_ids = response_ids or [20, 21]
@@ -517,6 +535,7 @@ def _trajectory(
         reward_score=reward_score,
         reward_metrics=dict(reward_metrics or {}),
         num_turns=num_turns,
+        chain_id=chain_id,
         routed_experts=routed_experts,
         multi_modal_data={"images": ["raw-image-should-not-be-written"]},
         extra_fields=dict(extra_fields or {}),
@@ -2126,3 +2145,379 @@ async def test_runner_reward_context_survives_tq_without_changing_training_field
         },
     ]
     assert "runner_reward_info" not in framework._trajectory_meta(trajectories[0])
+
+
+# ---------------------------------------------------------------------------
+# Custom trajectory selection (RFC-0001)
+# ---------------------------------------------------------------------------
+
+
+def _custom_runner_config(name: str, **kwargs: object) -> dict[str, object]:
+    """Inline runner configured for custom trajectory selection."""
+    return _inline_runner_config(
+        _async_noop_runner,
+        trajectory_selection=_select_config(name),
+        **kwargs,
+    )
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.parametrize(
+    ("trajectory_selection", "match"),
+    [
+        ("shortest", "Unknown trajectory selection"),
+        ({"custom_select_function": {"path": "", "name": "select"}}, "non-empty 'path' and 'name'"),
+        ({"custom_select_function": {"path": "pkg://x", "name": ""}}, "non-empty 'path' and 'name'"),
+        ({}, "custom_select_function requires non-empty 'path' and 'name'"),
+        (["all"], "trajectory_selection must be"),
+        (42, "trajectory_selection must be"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_framework_rejects_invalid_trajectory_selection_forms(fake_tq, trajectory_selection, match):
+    """Every malformed form fails at start-up with a runner-scoped message."""
+    with pytest.raises(ValueError, match=match):
+        await _build_framework_with_agent_runners(
+            agent_runners={
+                "runner": _inline_runner_config(_async_noop_runner, trajectory_selection=trajectory_selection)
+            },
+            gateway_manager=_FakeGatewayManager({}),
+        )
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_framework_rejects_top_level_custom_select_function(fake_tq):
+    """A custom_select_function outside trajectory_selection would be silently ignored."""
+    with pytest.raises(ValueError, match="must be nested under 'trajectory_selection'"):
+        await _build_framework_with_agent_runners(
+            agent_runners={
+                "runner": _inline_runner_config(
+                    _async_noop_runner,
+                    extra_config={"custom_select_function": {"path": "pkg://x", "name": "select"}},
+                )
+            },
+            gateway_manager=_FakeGatewayManager({}),
+        )
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_framework_rejects_unloadable_or_non_callable_select_function(fake_tq):
+    """A bad {path, name} must fail at construction, not on the first session."""
+    with pytest.raises(ValueError, match="cannot load select function"):
+        await _build_framework_with_agent_runners(
+            agent_runners={
+                "runner": _inline_runner_config(
+                    _async_noop_runner,
+                    trajectory_selection={
+                        "custom_select_function": {"path": "pkg://no_such_module_xyz", "name": "select"}
+                    },
+                )
+            },
+            gateway_manager=_FakeGatewayManager({}),
+        )
+
+    with pytest.raises(TypeError, match="is not callable"):
+        await _build_framework_with_agent_runners(
+            agent_runners={"runner": _custom_runner_config("NOT_CALLABLE")},
+            gateway_manager=_FakeGatewayManager({}),
+        )
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_custom_select_receives_session_and_trajectories(fake_tq):
+    """The select function is called once per session with (session_id, trajectories)."""
+    from tests.uni_agent.framework import select_fixtures
+
+    select_fixtures.CALLS.clear()
+    trajectories = [
+        _trajectory(response_ids=[30, 31], chain_id=1, extra_fields={"message_history": [{"role": "user"}]}),
+        _trajectory(response_ids=[40, 41], chain_id=2, extra_fields={"message_history": [{"role": "user"}]}),
+    ]
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": trajectories})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("record_calls")},
+        gateway_manager=runtime,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=4))
+
+    assert len(select_fixtures.CALLS) == 1
+    session_id, trajectory_ids = select_fixtures.CALLS[0]
+    assert session_id.startswith("session-sample-0-rollout-0")
+    assert trajectory_ids == [id(trajectory) for trajectory in trajectories]
+    # Both trajectories survive by default.
+    assert fake_tq.batch_puts[0]["keys"] == ["uid-0_0_0", "uid-0_0_1"]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_custom_select_keeps_and_drops_requested_trajectories(fake_tq):
+    """Dropping the first trajectory removes exactly that TQ entry."""
+    from tests.uni_agent.framework import select_fixtures
+
+    select_fixtures.CALLS.clear()
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [
+                _trajectory(response_ids=[30, 31], chain_id=1),
+                _trajectory(response_ids=[40, 41], chain_id=2),
+            ]
+        }
+    )
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("drop_first")},
+        gateway_manager=runtime,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=4))
+
+    assert len(fake_tq.batch_puts) == 1
+    batch = fake_tq.batch_puts[0]
+    assert batch["keys"] == ["uid-0_0_0"]
+    assert batch["fields"]["responses"][0].tolist() == [40, 41]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_custom_select_preserves_user_order_without_reordering(fake_tq):
+    """The framework never reorders: the user's return order is the TQ order."""
+    from tests.uni_agent.framework import select_fixtures
+
+    select_fixtures.CALLS.clear()
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [
+                _trajectory(response_ids=[30, 31], chain_id=1),
+                _trajectory(response_ids=[40, 41], chain_id=2),
+            ]
+        }
+    )
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("reverse_order")},
+        gateway_manager=runtime,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=4))
+
+    batch = fake_tq.batch_puts[0]
+    assert batch["keys"] == ["uid-0_0_0", "uid-0_0_1"]
+    assert batch["fields"]["responses"][0].tolist() == [40, 41]
+    assert batch["fields"]["responses"][1].tolist() == [30, 31]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_custom_select_supports_async_functions(fake_tq):
+    """An async select function is awaited rather than used as a coroutine."""
+    from tests.uni_agent.framework import select_fixtures
+
+    select_fixtures.CALLS.clear()
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory(response_ids=[30, 31])]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("async_record_calls")},
+        gateway_manager=runtime,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=4))
+
+    assert len(select_fixtures.CALLS) == 1
+    assert fake_tq.batch_puts[0]["keys"] == ["uid-0_0_0"]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_custom_select_runs_even_for_single_trajectory(fake_tq):
+    """The single-trajectory short-circuit applies to all/longest only."""
+    from tests.uni_agent.framework import select_fixtures
+
+    select_fixtures.CALLS.clear()
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory(response_ids=[30, 31])]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("drop_everything")},
+        gateway_manager=runtime,
+    )
+
+    # The select function still ran on the single trajectory instead of being
+    # short-circuited away; the user then dropped it, so the session is honestly
+    # empty and this all-empty batch is reported as a failed rollout batch.
+    with pytest.raises(RuntimeError, match="All rollouts failed"):
+        await framework.generate_sequences(_build_prompts(count=1, global_steps=4))
+
+    assert select_fixtures.CALLS and len(select_fixtures.CALLS[0][1]) == 1
+    assert fake_tq.batch_puts == []
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_custom_select_exception_falls_back_to_all(fake_tq, caplog):
+    """A raising select function keeps every trajectory and logs the failure."""
+    from tests.uni_agent.framework import select_fixtures
+
+    select_fixtures.CALLS.clear()
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [
+                _trajectory(response_ids=[30, 31], chain_id=1),
+                _trajectory(response_ids=[40, 41], chain_id=2),
+            ]
+        }
+    )
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("raise_boom")},
+        gateway_manager=runtime,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="uni_agent.framework.framework"):
+        await framework.generate_sequences(_build_prompts(count=1, global_steps=4))
+
+    assert fake_tq.batch_puts[0]["keys"] == ["uid-0_0_0", "uid-0_0_1"]
+    assert any("falling back to 'all'" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_custom_select_empty_result_uses_empty_status_path(fake_tq):
+    """An intentional empty selection produces no TQ write at all."""
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [
+                _trajectory(response_ids=[30, 31], chain_id=1),
+                _trajectory(response_ids=[40, 41], chain_id=2),
+            ]
+        }
+    )
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("drop_everything")},
+        gateway_manager=runtime,
+    )
+
+    # Kept as-is per RFC: an empty session counts as a failed session, so a
+    # batch whose every session is empty fails the rollout batch.
+    with pytest.raises(RuntimeError, match="All rollouts failed"):
+        await framework.generate_sequences(_build_prompts(count=1, global_steps=4))
+
+    assert fake_tq.batch_puts == []
+    assert [put["tag"]["status"] for put in fake_tq.puts] == ["running", "failure"]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_custom_select_releases_message_history_before_tq_and_scoring(fake_tq, monkeypatch):
+    """Message text must not survive into reward scoring, TQ fields, or the dump."""
+    from tests.uni_agent.framework import select_fixtures
+
+    select_fixtures.CALLS.clear()
+    seen_at_score = []
+    scored_responses = []
+
+    async def fake_score(self, trajectories, sample_fields, task_result):
+        seen_at_score.extend("message_history" in trajectory.extra_fields for trajectory in trajectories)
+        scored_responses.extend(trajectory.response_ids for trajectory in trajectories)
+        return [(1.0, {}) for _ in trajectories]
+
+    monkeypatch.setattr(GatewayAgentFramework, "_score_trajectories", fake_score)
+
+    message_history = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "do the task"},
+    ]
+    dropped = _trajectory(response_ids=[30, 31], chain_id=1, extra_fields={"message_history": message_history})
+    kept = _trajectory(response_ids=[40, 41], chain_id=2, extra_fields={"message_history": message_history})
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [dropped, kept]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("drop_first")},
+        gateway_manager=runtime,
+        reward_loop_worker_handles=["sentinel"],
+        reward_config={"custom_reward_function": {"path": "pkg://custom_reward.py"}},
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=4))
+
+    # Released for the kept trajectory *and* the discarded one.
+    assert "message_history" not in dropped.extra_fields
+    assert "message_history" not in kept.extra_fields
+    # Scoring already ran after the release.
+    assert seen_at_score == [False]
+    assert scored_responses == [[40, 41]]
+    # The TQ field carries no raw chat text.
+    for extra in tu.get(fake_tq.batch_puts[0]["fields"], "extra_fields"):
+        assert "message_history" not in extra
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_custom_select_pass_through_flag_is_set_only_for_custom(fake_tq):
+    """The gateway only copies message text for runners that actually read it."""
+    runtime_custom = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory()]})
+    framework_custom = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("record_calls")},
+        gateway_manager=runtime_custom,
+    )
+    await framework_custom.generate_sequences(_build_prompts(count=1, global_steps=4))
+    assert runtime_custom.created_session_kwargs[0]["pass_through_message_history"] is True
+
+    runtime_all = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory()]})
+    framework_all = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime_all,
+    )
+    await framework_all.generate_sequences(_build_prompts(count=1, global_steps=4))
+    assert runtime_all.created_session_kwargs[0]["pass_through_message_history"] is False
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_multiple_runners_use_their_own_select_function(fake_tq):
+    """Two runners in one framework keep independent select functions."""
+    from tests.uni_agent.framework import select_fixtures
+
+    select_fixtures.CALLS.clear()
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [
+                _trajectory(response_ids=[30, 31], chain_id=1),
+                _trajectory(response_ids=[40, 41], chain_id=2),
+            ],
+            "session-sample-1-rollout-0": [
+                _trajectory(response_ids=[50, 51], chain_id=1),
+                _trajectory(response_ids=[60, 61], chain_id=2),
+            ],
+        }
+    )
+    prompts = _build_prompts(count=2, global_steps=4)
+    prompts["agent_name"] = tu.get_tensordict(
+        tensor_dict={"agent_name": ["drop", "keep"]},
+        non_tensor_dict={},
+    )["agent_name"]
+
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={
+            "drop": _custom_runner_config("drop_first"),
+            "keep": _custom_runner_config("record_calls"),
+        },
+        gateway_manager=runtime,
+    )
+
+    await framework.generate_sequences(prompts)
+
+    by_uid = {put["keys"][0].split("_")[0]: put for put in fake_tq.batch_puts}
+    assert by_uid["uid-0"]["keys"] == ["uid-0_0_0"]
+    assert by_uid["uid-0"]["fields"]["responses"][0].tolist() == [40, 41]
+    assert by_uid["uid-1"]["keys"] == ["uid-1_0_0", "uid-1_0_1"]
+    assert len(select_fixtures.CALLS) == 2

@@ -116,11 +116,75 @@ finalized trajectories before reward scoring and artifact logging. The order is:
 
 ```text
 Gateway finalization
-    -> Runner trajectory_selection (all or longest)
+    -> Runner trajectory_selection (all / longest / custom)
     -> trajectory postprocessor
     -> reward scoring
     -> trajectory logs and TransferQueue
 ```
+
+### Trajectory selection
+
+A session can split into several trajectories (compaction, subagent switches,
+title generation, branch rollback). `agent_runners.<name>.trajectory_selection`
+decides which of them are kept. Two type-disjoint forms are accepted — the form
+is the mode, there is no `mode` field:
+
+```yaml
+agent_runners:
+  <name>:
+    # form 1 (historical): keep everything, or the single longest trajectory
+    trajectory_selection: all        # default | longest
+    # form 2 (custom): call a user-owned function and keep what it returns
+    trajectory_selection:
+      custom_select_function:
+        path: /abs/path/to/title_filter.py   # or pkg://my_pkg.trajectory_select
+        name: select_without_title_segments
+```
+
+`longest` keeps the trajectory with the most model-generated tokens, breaking
+ties by response length, turn count, then input order.
+
+In custom mode the framework loads `{path, name}` **at start-up** (the same
+two-part pattern as `reward.custom_reward_function`, so module and attribute
+resolution never collide) and fails fast on an unimportable module, a missing
+attribute or a non-callable target. Each runner owns its own function, so a
+framework configured with several `agent_runners` can mix selectors freely.
+Both sync and async functions are supported.
+
+The function is called once per session:
+
+```python
+def select_session_trajectories(session_id: str, trajectories: list[Trajectory]) -> list[Trajectory]:
+    return trajectories
+```
+
+Each trajectory carries `chain_id` (creation order: allocated from a counter
+starting at 1, strictly increasing, immutable after creation) plus the usual
+structural signals. Note that the list arrives in the gateway's **close order**
+(most-recently-active last); sort by `chain_id` yourself if you need creation
+order. In custom mode each trajectory also carries
+`extra_fields["message_history"]`, the raw chat text of its chain. That copy is
+made at materialization time — for both finalize-materialized chains and chains
+closed mid-generation because they exhausted their trajectory capacity — and it
+is a shallow list copy, so the message dicts are shared with the session and
+must be treated as read-only.
+
+What the framework does with the result:
+
+- keeps it verbatim, in the returned order (no re-sorting, no filtering on top);
+- an empty return means "drop this session": it takes the existing
+  `status="empty"` path and counts as a failed session (no TQ write, no reward);
+- a raised exception (or a failing coroutine) logs and falls back to keeping
+  all trajectories;
+- `message_history` is released right after the call, for kept and discarded
+  trajectories alike — before reward scoring, artifact logging and the TQ write.
+  It therefore never reaches the training data, and a configured
+  `trajectory_postprocessor` cannot read it either. If a postprocessor ever
+  needs the text, move the release later and re-check those consumers.
+
+`all` / `longest` never load a function and never carry message text, so
+unconfigured runs keep their historical zero-copy behaviour. See
+`examples/trajectory_selectors/` for sample selectors.
 
 Configure a postprocessor at the Framework level:
 
