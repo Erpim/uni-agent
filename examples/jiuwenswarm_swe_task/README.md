@@ -85,6 +85,10 @@ When a select function is configured the gateway also copies the chain's chat
 text into `extra_fields["message_history"]`; the framework releases it right after
 the selection step, before reward scoring and the TransferQueue write.
 
+Turns this filter drops are dumped as `dropped_trajectory.json` /
+`dropped_trajectory.npz`, next to the kept `trajectory.*` files and in the same
+format, so a dropped turn can be measured and compared afterwards.
+
 ## Files
 
 | File | Purpose |

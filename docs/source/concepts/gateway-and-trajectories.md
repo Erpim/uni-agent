@@ -172,10 +172,14 @@ must be treated as read-only.
 What the framework does with the result:
 
 - keeps it verbatim, in the returned order (no re-sorting, no filtering on top);
+- accepts a new list or the list it was handed, mutated in place. Copies work
+  too (`deepcopy`, or `replace` with a new `extra_fields`), as long as the
+  rebuilt entries keep their `chain_id` — that is what the discarded set is
+  matched on;
 - an empty return means "drop this session": it takes the existing
   `status="empty"` path and counts as a failed session (no TQ write, no reward);
 - a raised exception (or a failing coroutine) logs and falls back to keeping
-  all trajectories;
+  every trajectory the session produced;
 - `message_history` is released right after the call, for kept and discarded
   trajectories alike — before reward scoring, artifact logging and the TQ write.
   It therefore never reaches the training data, and a configured
@@ -185,6 +189,25 @@ What the framework does with the result:
 `all` / `longest` never load a function and never carry message text, so
 unconfigured runs keep their historical zero-copy behaviour. See
 `examples/trajectory_selectors/` for sample selectors.
+
+#### Discarded trajectories are still dumped
+
+Whatever the selection policy discards — custom selections and the `longest`
+losers alike — is written next to the session artifacts, in the same format as
+the kept ones:
+
+```
+<log_dir>/step_<n>/<session_id>/
+├── trajectory.json          # kept
+├── trajectory.npz
+├── dropped_trajectory.json  # discarded
+└── dropped_trajectory.npz
+```
+
+Both files carry the same fields and per-token arrays as their kept
+counterparts, so a discarded chain stays as inspectable as a kept one. They are
+written only when something was dropped, and they follow the existing `log_dir`
+setting: there is no separate audit switch. Message text is never dumped.
 
 Configure a postprocessor at the Framework level:
 

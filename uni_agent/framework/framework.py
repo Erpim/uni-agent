@@ -266,16 +266,20 @@ def _select_session_trajectories(
     # Custom mode deliberately skips the len<=1 short-circuit above: a single
     # trajectory can still be the one the user wants dropped (e.g. a title-only
     # session). The decision, and the empty result, are the user's.
+    #
+    # The function may mutate the list it is handed, so the "keep everything"
+    # fallback reads a snapshot instead of that list.
+    preselected_trajectories = list(trajectories)
     kept: list[Trajectory] | Awaitable[list[Trajectory]]
     try:
         kept = select_fn(session_id, trajectories)
     except Exception:
         logger.exception("session %s: custom select raised; falling back to 'all'", session_id)
-        kept = trajectories
+        kept = preselected_trajectories
 
     if inspect.isawaitable(kept):
-        return _await_custom_select_and_release(session_id, trajectories, kept)
-    return _finalize_custom_select(session_id, trajectories, kept)
+        return _await_custom_select_and_release(session_id, preselected_trajectories, kept)
+    return _finalize_custom_select(session_id, preselected_trajectories, kept)
 
 
 async def _await_custom_select_and_release(
@@ -301,15 +305,15 @@ def _finalize_custom_select(
     if not isinstance(kept, list):
         kept = list(kept)
 
-    # Single release point for the whole session, discarded trajectories
-    # included: it happens before reward scoring, the reward-info rewrite (which
-    # copies extra_fields into a fresh dict), artifact logging and the TQ write,
-    # so message text reaches none of them. ``kept`` is a subset of
-    # ``trajectories``, so one pass covers it too. A configured
-    # trajectory_postprocessor therefore cannot read message_history anymore;
-    # move the release later (and re-check those consumers) if that is ever
-    # needed.
-    for trajectory in trajectories:
+    # Single release point for the whole session: it happens before reward
+    # scoring, the reward-info rewrite (which copies extra_fields into a fresh
+    # dict), artifact logging and the TQ write, so message text reaches none of
+    # them. ``kept`` covers both sides because a select function may return
+    # copies (``deepcopy``, or ``replace`` with a new ``extra_fields``) that the
+    # input list no longer reaches. A configured trajectory_postprocessor
+    # therefore cannot read message_history anymore; move the release later
+    # (and re-check those consumers) if that is ever needed.
+    for trajectory in [*trajectories, *kept]:
         trajectory.extra_fields.pop("message_history", None)
 
     if not kept:
@@ -1031,6 +1035,9 @@ class GatewayAgentFramework(AgentFramework):
                         f"Agent runner {runner_name!r} must return TaskResult or None, got {type(task_result).__name__}"
                     )
                 session_trajectories = await self.gateway_manager.finalize_session(session_id)
+                # Audit only: this is the full list the policy chose from, kept so
+                # the dump can report what it discarded. Skipped when logging is off.
+                audit_candidates = list(session_trajectories) if run_dir is not None else []
                 session_trajectories = _select_session_trajectories(
                     session_id,
                     session_trajectories,
@@ -1039,6 +1046,14 @@ class GatewayAgentFramework(AgentFramework):
                 )
                 if inspect.isawaitable(session_trajectories):
                     session_trajectories = await session_trajectories
+                dropped_trajectories: list[Trajectory] = []
+                if run_dir is not None:
+                    # chain_id, not id(): a select function may return copies, and
+                    # chain_id is what identifies the chain a copy came from.
+                    kept_chain_ids = {trajectory.chain_id for trajectory in session_trajectories}
+                    dropped_trajectories = [
+                        trajectory for trajectory in audit_candidates if trajectory.chain_id not in kept_chain_ids
+                    ]
             except asyncio.CancelledError:
                 # Parent shutdown/cancellation must not leave the Gateway route
                 # and actor-owned session live after the runner task is gone.
@@ -1077,6 +1092,16 @@ class GatewayAgentFramework(AgentFramework):
                 session_trajectories = await self._apply_trajectory_postprocessor(session_trajectories, task_result)
 
             if not session_trajectories:
+                # Even an empty session has an audit story: a select function that
+                # dropped everything. Keep the dump so the discard is inspectable.
+                if run_dir is not None and dropped_trajectories:
+                    await asyncio.to_thread(
+                        self._dump_trajectories,
+                        run_dir,
+                        session_id,
+                        [],
+                        dropped_trajectories,
+                    )
                 session_trace.finish(
                     runner_name=runner_name,
                     status="empty",
@@ -1120,7 +1145,13 @@ class GatewayAgentFramework(AgentFramework):
 
             self._log_trajectory_summary(session_id, result_trajectories)
             if run_dir is not None:
-                await asyncio.to_thread(self._dump_trajectories, run_dir, session_id, result_trajectories)
+                await asyncio.to_thread(
+                    self._dump_trajectories,
+                    run_dir,
+                    session_id,
+                    result_trajectories,
+                    dropped_trajectories,
+                )
             session_trace.finish(
                 runner_name=runner_name,
                 status="success",
@@ -1189,7 +1220,13 @@ class GatewayAgentFramework(AgentFramework):
                 )
         logger.info("\n".join(lines))
 
-    def _dump_trajectories(self, run_dir: Path, session_id: str, trajectories: list[Trajectory]) -> None:
+    def _dump_trajectories(
+        self,
+        run_dir: Path,
+        session_id: str,
+        trajectories: list[Trajectory],
+        dropped_trajectories: list[Trajectory] | None = None,
+    ) -> None:
         """Persist finalized trajectories next to ``task.log``.
 
         Split by cost: a small human-readable summary (reward, turns, lengths) is written
@@ -1198,33 +1235,53 @@ class GatewayAgentFramework(AgentFramework):
         (token ids repeat, the mask is runs of 0/1), so this is far smaller and faster than
         the old indented-JSON dump -- which matters most on a network / HDFS log_dir.
 
+        Trajectories the selection policy discarded get the same treatment under
+        ``dropped_trajectory.json`` / ``dropped_trajectory.npz``, so a discarded chain is
+        still inspectable after the session finalizes. They are kept in separate files
+        rather than appended to ``trajectory.json``: that file's ``num_trajectories`` and
+        ``trajectories`` describe *training inputs*, and external validators assert on
+        exactly that.
+
         Runs off the event loop (caller wraps this in ``asyncio.to_thread``) and is
         best-effort: an IO / serialization error is logged but never aborts the rollout.
         """
         try:
             run_dir.mkdir(parents=True, exist_ok=True)
-            meta = {
-                "session_id": session_id,
-                "num_trajectories": len(trajectories),
-                "trajectories": [self._trajectory_meta(traj) for traj in trajectories],
-            }
-            (run_dir / "trajectory.json").write_text(
-                json.dumps(meta, ensure_ascii=False, separators=(",", ":"), default=_json_default),
-                encoding="utf-8",
-            )
-            arrays: dict[str, np.ndarray] = {}
-            for i, traj in enumerate(trajectories):
-                arrays[f"traj{i}_prompt_ids"] = np.asarray(traj.prompt_ids, dtype=np.int32)
-                arrays[f"traj{i}_response_ids"] = np.asarray(traj.response_ids, dtype=np.int32)
-                arrays[f"traj{i}_response_mask"] = np.asarray(traj.response_mask, dtype=np.int8)
-                if traj.response_logprobs is not None:
-                    arrays[f"traj{i}_response_logprobs"] = np.asarray(traj.response_logprobs, dtype=np.float32)
-
-            buf = io.BytesIO()
-            np.savez_compressed(buf, **arrays)
-            (run_dir / "trajectory.npz").write_bytes(buf.getvalue())
+            if trajectories:
+                self._write_trajectory_group(run_dir, session_id, "trajectory", trajectories)
+            if dropped_trajectories:
+                self._write_trajectory_group(run_dir, session_id, "dropped_trajectory", dropped_trajectories)
         except Exception:
             logger.exception("session %s: failed to write trajectory dump under %s", session_id, run_dir)
+
+    def _write_trajectory_group(
+        self,
+        run_dir: Path,
+        session_id: str,
+        stem: str,
+        trajectories: list[Trajectory],
+    ) -> None:
+        """Write one ``<stem>.json`` summary plus its ``<stem>.npz`` token arrays."""
+        meta = {
+            "session_id": session_id,
+            "num_trajectories": len(trajectories),
+            "trajectories": [self._trajectory_meta(traj) for traj in trajectories],
+        }
+        (run_dir / f"{stem}.json").write_text(
+            json.dumps(meta, ensure_ascii=False, separators=(",", ":"), default=_json_default),
+            encoding="utf-8",
+        )
+        arrays: dict[str, np.ndarray] = {}
+        for i, traj in enumerate(trajectories):
+            arrays[f"traj{i}_prompt_ids"] = np.asarray(traj.prompt_ids, dtype=np.int32)
+            arrays[f"traj{i}_response_ids"] = np.asarray(traj.response_ids, dtype=np.int32)
+            arrays[f"traj{i}_response_mask"] = np.asarray(traj.response_mask, dtype=np.int8)
+            if traj.response_logprobs is not None:
+                arrays[f"traj{i}_response_logprobs"] = np.asarray(traj.response_logprobs, dtype=np.float32)
+
+        buf = io.BytesIO()
+        np.savez_compressed(buf, **arrays)
+        (run_dir / f"{stem}.npz").write_bytes(buf.getvalue())
 
     def _trajectory_meta(self, traj: Trajectory) -> dict[str, object]:
         """Small, human-readable per-trajectory summary; the token arrays live in the npz."""

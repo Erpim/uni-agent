@@ -2521,3 +2521,311 @@ async def test_multiple_runners_use_their_own_select_function(fake_tq):
     assert by_uid["uid-0"]["fields"]["responses"][0].tolist() == [40, 41]
     assert by_uid["uid-1"]["keys"] == ["uid-1_0_0", "uid-1_0_1"]
     assert len(select_fixtures.CALLS) == 2
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_mixed_custom_and_all_runners_in_one_framework(tmp_path, fake_tq):
+    """Per-runner settings stay independent: only the custom one copies text and audits."""
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [
+                _trajectory(chain_id=1, num_turns=5),
+                _trajectory(chain_id=2, num_turns=2),
+            ],
+            "session-sample-1-rollout-0": [
+                _trajectory(chain_id=1, num_turns=5),
+                _trajectory(chain_id=2, num_turns=2),
+            ],
+        }
+    )
+    prompts = _build_prompts(count=2, global_steps=3)
+    prompts["agent_name"] = tu.get_tensordict(
+        tensor_dict={"agent_name": ["drop", "keepall"]},
+        non_tensor_dict={},
+    )["agent_name"]
+
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={
+            "drop": _custom_runner_config("drop_first"),
+            "keepall": _inline_runner_config(_async_noop_runner),
+        },
+        gateway_manager=runtime,
+        log_dir=str(tmp_path),
+    )
+
+    await framework.generate_sequences(prompts)
+
+    # The gateway copies message text only for the runner that reads it.
+    assert [kwargs["pass_through_message_history"] for kwargs in runtime.created_session_kwargs] == [True, False]
+
+    by_uid = {put["keys"][0].split("_")[0]: put for put in fake_tq.batch_puts}
+    assert by_uid["uid-0"]["keys"] == ["uid-0_0_0"]
+    assert by_uid["uid-1"]["keys"] == ["uid-1_0_0", "uid-1_0_1"]
+
+    # Only the custom runner discards anything, so only it writes an audit dump.
+    dumps = {}
+    for session_dir in (tmp_path / "step_3").iterdir():
+        dumps[session_dir.name] = sorted(path.name for path in session_dir.iterdir())
+    audit_names = [name for name, entries in dumps.items() if "dropped_trajectory.json" in entries]
+    plain_names = [name for name, entries in dumps.items() if "dropped_trajectory.json" not in entries]
+    assert len(audit_names) == 1
+    assert len(plain_names) == 1
+    audited = _read_dump(tmp_path / "step_3" / audit_names[0], "dropped_trajectory")
+    assert audited["num_trajectories"] == 1
+    # drop_first discards the first trajectory, the 5-turn one.
+    assert audited["trajectories"][0]["num_turns"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Audit trail for discarded trajectories
+# ---------------------------------------------------------------------------
+
+
+def _dump_arrays(path):
+    """Load a ``<stem>.npz`` dump into a plain dict."""
+    import numpy as np
+
+    with np.load(path) as data:
+        return {name: data[name] for name in data.files}
+
+
+def _read_dump(run_dir, stem):
+    return json.loads((run_dir / f"{stem}.json").read_text())
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_dropped_trajectories_are_dumped_like_kept_ones(tmp_path, fake_tq):
+    """A discarded chain must stay inspectable: same files, same fields, same arrays."""
+    # drop_first keeps everything but the FIRST trajectory, so list the discard first.
+    discarded = _trajectory(prompt_ids=[50, 51], response_ids=[60, 61, 62], num_turns=7, chain_id=1)
+    kept = _trajectory(prompt_ids=[10, 11], response_ids=[40, 41], num_turns=3, chain_id=2)
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [discarded, kept]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("drop_first")},
+        gateway_manager=runtime,
+        log_dir=str(tmp_path),
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=5))
+
+    session_dir = next((tmp_path / "step_5").iterdir())
+    kept_dump = _read_dump(session_dir, "trajectory")
+    dropped_dump = _read_dump(session_dir, "dropped_trajectory")
+
+    # trajectory.json keeps describing training inputs only.
+    assert kept_dump["num_trajectories"] == 1
+    assert kept_dump["trajectories"][0]["num_turns"] == 3
+    # The dropped chain is recorded alongside, with the same meta shape.
+    assert dropped_dump["num_trajectories"] == 1
+    assert dropped_dump["trajectories"][0]["num_turns"] == 7
+    assert set(kept_dump["trajectories"][0]) == set(dropped_dump["trajectories"][0])
+
+    kept_arrays = _dump_arrays(session_dir / "trajectory.npz")
+    dropped_arrays = _dump_arrays(session_dir / "dropped_trajectory.npz")
+    assert kept_arrays["traj0_response_ids"].tolist() == [40, 41]
+    assert dropped_arrays["traj0_response_ids"].tolist() == [60, 61, 62]
+    assert dropped_arrays["traj0_prompt_ids"].tolist() == [50, 51]
+    assert set(kept_arrays) == set(dropped_arrays)
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_no_dropped_files_when_nothing_is_dropped(tmp_path, fake_tq):
+    """A session that keeps everything must not gain empty audit files."""
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory()]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+        log_dir=str(tmp_path),
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=9))
+
+    session_dir = next((tmp_path / "step_9").iterdir())
+    assert (session_dir / "trajectory.json").exists()
+    assert not (session_dir / "dropped_trajectory.json").exists()
+    assert not (session_dir / "dropped_trajectory.npz").exists()
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_longest_selection_audits_its_discards(tmp_path, fake_tq):
+    """Auditing is not custom-only: longest drops n-1 chains and those are recorded."""
+    winner = _trajectory(response_ids=[30, 31, 32], response_mask=[1, 1, 1], num_turns=2, chain_id=1)
+    loser = _trajectory(
+        response_ids=[20, 21, 22, 23, 24, 25], response_mask=[1, 0, 0, 0, 0, 0], num_turns=10, chain_id=2
+    )
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [winner, loser]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner, trajectory_selection="longest")},
+        gateway_manager=runtime,
+        log_dir=str(tmp_path),
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=6))
+
+    session_dir = next((tmp_path / "step_6").iterdir())
+    kept_dump = _read_dump(session_dir, "trajectory")
+    dropped_dump = _read_dump(session_dir, "dropped_trajectory")
+    assert kept_dump["num_trajectories"] == 1
+    assert kept_dump["trajectories"][0]["num_turns"] == 2
+    assert dropped_dump["num_trajectories"] == 1
+    assert dropped_dump["trajectories"][0]["num_turns"] == 10
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["deepcopy_first", "replace_first_fresh_extras"])
+async def test_discard_dump_survives_a_copied_kept_list(tmp_path, fake_tq, name):
+    """A selector may return copies; the discards must still be reported correctly."""
+    # Order matters: both fixtures keep the first trajectory, so the second is the discard.
+    kept = _trajectory(chain_id=1, num_turns=3)
+    discarded = _trajectory(chain_id=2, num_turns=7)
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [kept, discarded]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config(name)},
+        gateway_manager=runtime,
+        log_dir=str(tmp_path),
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=6))
+
+    session_dir = next((tmp_path / "step_6").iterdir())
+    # Exactly one discard: the copy must not make its own chain look dropped too.
+    dropped_dump = _read_dump(session_dir, "dropped_trajectory")
+    assert dropped_dump["num_trajectories"] == 1
+    assert dropped_dump["trajectories"][0]["num_turns"] == 7
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_empty_selection_still_audits_the_discards(tmp_path, fake_tq):
+    """A select that drops everything leaves no trajectory.json but must log why."""
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory(num_turns=4, chain_id=1)]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("drop_everything")},
+        gateway_manager=runtime,
+        log_dir=str(tmp_path),
+    )
+
+    with pytest.raises(RuntimeError, match="All rollouts failed"):
+        await framework.generate_sequences(_build_prompts(count=1, global_steps=7))
+
+    session_dir = next((tmp_path / "step_7").iterdir())
+    assert not (session_dir / "trajectory.json").exists()
+    assert not (session_dir / "trajectory.npz").exists()
+    dropped_dump = _read_dump(session_dir, "dropped_trajectory")
+    assert dropped_dump["num_trajectories"] == 1
+    assert dropped_dump["trajectories"][0]["num_turns"] == 4
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_dropped_dump_follows_the_policy_and_not_object_equality(tmp_path, fake_tq):
+    """Two trajectories with identical content must still be told apart by chain_id."""
+    first = _trajectory(chain_id=1, num_turns=3)
+    second = _trajectory(chain_id=2, num_turns=3)  # same content, different chain
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [first, second]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("drop_first")},
+        gateway_manager=runtime,
+        log_dir=str(tmp_path),
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=2))
+
+    session_dir = next((tmp_path / "step_2").iterdir())
+    assert _read_dump(session_dir, "trajectory")["num_trajectories"] == 1
+    assert _read_dump(session_dir, "dropped_trajectory")["num_trajectories"] == 1
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_no_discard_bookkeeping_when_logging_is_off(tmp_path, fake_tq):
+    """Without log_dir there is nothing to dump, so the discarded set is not computed."""
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory(chain_id=1), _trajectory(chain_id=2)]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("drop_first")},
+        gateway_manager=runtime,
+        log_dir="",
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=5))
+
+    assert not any(tmp_path.iterdir())
+    for extra in tu.get(fake_tq.batch_puts[0]["fields"], "extra_fields"):
+        assert "message_history" not in extra
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_in_place_selection_still_audits_the_discards(tmp_path, fake_tq):
+    """A selector may mutate the list it was given; the audit diff must survive."""
+    discarded = _trajectory(prompt_ids=[50, 51], response_ids=[60], num_turns=5, chain_id=1)
+    kept = _trajectory(prompt_ids=[10, 11], response_ids=[40, 41], num_turns=2, chain_id=2)
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [discarded, kept]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("drop_first_in_place")},
+        gateway_manager=runtime,
+        log_dir=str(tmp_path),
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=3))
+
+    session_dir = next((tmp_path / "step_3").iterdir())
+    kept_dump = _read_dump(session_dir, "trajectory")
+    dropped_dump = _read_dump(session_dir, "dropped_trajectory")
+    assert kept_dump["num_trajectories"] == 1
+    assert kept_dump["trajectories"][0]["num_turns"] == 2
+    assert dropped_dump["num_trajectories"] == 1
+    assert dropped_dump["trajectories"][0]["num_turns"] == 5
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_in_place_async_selection_still_audits_the_discards(tmp_path, fake_tq):
+    """Same guarantee for a coroutine that mutates after its await."""
+    discarded = _trajectory(num_turns=9, chain_id=1)
+    kept = _trajectory(num_turns=1, chain_id=2)
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [discarded, kept]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _custom_runner_config("async_drop_first_in_place")},
+        gateway_manager=runtime,
+        log_dir=str(tmp_path),
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=4))
+
+    session_dir = next((tmp_path / "step_4").iterdir())
+    assert _read_dump(session_dir, "trajectory")["trajectories"][0]["num_turns"] == 1
+    assert _read_dump(session_dir, "dropped_trajectory")["trajectories"][0]["num_turns"] == 9
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_in_place_mutation_then_raise_still_falls_back_to_everything():
+    """A function that empties the list and raises must not lose trajectories."""
+    from uni_agent.framework.framework import _select_session_trajectories
+
+    first = _trajectory(chain_id=1)
+    second = _trajectory(chain_id=2)
+    trajectories = [first, second]
+
+    def boom(session_id, items):
+        items.clear()
+        raise RuntimeError("boom")
+
+    kept = _select_session_trajectories("s", trajectories, "custom", select_fn=boom)
+    assert kept == [first, second]

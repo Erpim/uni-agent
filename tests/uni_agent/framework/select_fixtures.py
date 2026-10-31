@@ -40,6 +40,34 @@ def drop_everything(session_id: str, trajectories: list) -> list:
     return []
 
 
+def drop_first_in_place(session_id: str, trajectories: list) -> list:
+    """Same outcome as ``drop_first`` but mutates the caller's list instead of copying.
+
+    Both styles are legal, and the framework must reach the same audit result
+    either way: it snapshots the list before the call.
+    """
+    CALLS.append((session_id, [id(trajectory) for trajectory in trajectories]))
+    del trajectories[0]
+    return trajectories
+
+
+def deepcopy_first(session_id: str, trajectories: list) -> list:
+    """Keep a deep copy of the first trajectory, keeping nothing from the input objects."""
+    import copy
+
+    CALLS.append((session_id, [id(trajectory) for trajectory in trajectories]))
+    return copy.deepcopy(trajectories[:1])
+
+
+def replace_first_fresh_extras(session_id: str, trajectories: list) -> list:
+    """Rebuild the first trajectory with a fresh ``extra_fields`` dict."""
+    from dataclasses import replace
+
+    CALLS.append((session_id, [id(trajectory) for trajectory in trajectories]))
+    first = trajectories[0]
+    return [replace(first, extra_fields=dict(first.extra_fields))]
+
+
 def raise_boom(session_id: str, trajectories: list) -> list:
     """Fail loudly so the framework has to fall back to 'all'."""
     CALLS.append((session_id, [id(trajectory) for trajectory in trajectories]))
@@ -53,6 +81,16 @@ async def async_record_calls(session_id: str, trajectories: list) -> list:
     await asyncio.sleep(0)
     CALLS.append((session_id, [id(trajectory) for trajectory in trajectories]))
     return list(trajectories)
+
+
+async def async_drop_first_in_place(session_id: str, trajectories: list) -> list:
+    """Async variant that mutates in place after an await."""
+    import asyncio
+
+    await asyncio.sleep(0)
+    CALLS.append((session_id, [id(trajectory) for trajectory in trajectories]))
+    del trajectories[0]
+    return trajectories
 
 
 #: Deliberately not a function, to prove the loader rejects non-callables.
