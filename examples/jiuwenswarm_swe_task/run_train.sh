@@ -114,6 +114,9 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$(basename "${MODEL_PATH}")}"
 MASK_UNFINISHED_EPISODE="${MASK_UNFINISHED_EPISODE:-True}"
 AGENT_LOG_DIR="${AGENT_LOG_DIR:-/home/${USER}/uni_agent_logs}"
 NUM_AGENT_WORKERS="${NUM_AGENT_WORKERS:-8}"
+# Trajectory selection (RFC-0001): drop jiuwenswarm's context-compression turns.
+SELECT_FUNCTION_PY="${REPO_ROOT}/examples/jiuwenswarm_swe_task/jiuwenswarm_compaction_filter.py"
+SELECT_FUNCTION_NAME="select_without_compaction"
 
 RUNNER_ARGS=(
     "+actor_rollout_ref.rollout.agent.agent_loop_manager_class=uni_agent.framework.entry.AgentFrameworkRolloutAdapter"
@@ -125,6 +128,8 @@ RUNNER_ARGS=(
     "+actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.session_timeout_seconds=${SESSION_TIMEOUT_SECONDS}"
     "+actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.task_config_path=${TASK_CONFIG}"
     "+actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.model_name=${SERVED_MODEL_NAME}"
+    "+actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.trajectory_selection.custom_select_function.path=${SELECT_FUNCTION_PY}"
+    "+actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.trajectory_selection.custom_select_function.name=${SELECT_FUNCTION_NAME}"
     "+actor_rollout_ref.rollout.custom.agent_framework.mask_unfinished_episode=${MASK_UNFINISHED_EPISODE}"
 )
 
@@ -182,6 +187,7 @@ echo "Engine:      ${ENGINE} (gen_tp=${GEN_TP}, train_tp=${TRAIN_TP})"
 echo "Task config: ${TASK_CONFIG}"
 echo "Tool parser: ${TOOL_PARSER}"
 echo "Mask:        mask_unfinished_episode=${MASK_UNFINISHED_EPISODE}"
+echo "Selection:   drop compaction turns via ${SELECT_FUNCTION_NAME}"
 echo "Batch:       n=${N}, mini_bsz=${PPO_MINI_BATCH_SIZE}"
 echo "Sequence:    prompt=${PROMPT_LENGTH}, response=${RESPONSE_LENGTH}"
 echo "Trainer:     V1 ${TRAINER_MODE}"

@@ -29,39 +29,23 @@
   prompt_template: &swe_jiuwenswarm_prompt
     - role: user
       content: |-
-        I have uploaded a code repository at /testbed with its development environment
-        fully set up (all dependencies installed). I have already taken care of all test
-        file changes related to the issue — you do NOT need to modify any tests. Consider
-        the following issue description:
+        You are fixing a bug in the repository at /testbed (all dependencies installed).
+        Do not modify or add any test files, the tests for the fix already exist.
+
+        The issue to fix:
 
         <issue_description>
         {problem_statement}
         </issue_description>
 
-        Implement the minimal changes to non-test files in /testbed that fix the issue.
-        Follow these steps:
-        1. Explore the codebase to locate and understand the code relevant to the issue.
-        2. Reproduce the bug with a small script (e.g. /testbed/reproduce_issue.py) and
-           confirm it fails. The script should also assert the expected behavior after
-           the fix.
-        3. Identify the root cause and choose the most correct, minimal fix among the
-           approaches you consider.
-        4. Implement the fix in the relevant non-test files.
-        5. Rerun the reproduction script and confirm it passes; iterate if needed.
-        6. Test edge cases in a separate file (e.g. /testbed/edge_case_tests.py), adding
-           and running several rounds of cases until the fix is robust and no existing
-           behavior regresses.
-        7. Run the relevant unit tests using the repository's own test runner to confirm
-           the fix introduces no regressions.
-        8. When the checks above pass, stop and summarize the root cause and the change.
+        Constraints:
+        - Change non-test source files only. Keep the change minimal and targeted.
+        - Do not commit.
 
-        Boundaries:
-        - Do NOT modify or add test files, and do NOT commit changes.
-        - Do NOT install or modify packages; use the environment as-is.
-        - Touch only the non-test source files needed for the fix.
-
-        Success: the issue no longer occurs, existing tests still pass, and the change is
-        minimal and general.
+        You must finish with direct evidence from running code: reproduce the issue
+        before fixing; after your change, re-run the reproduction and run the specific
+        tests that exercise the changed behavior, and confirm they pass. Your final
+        message must state which tests you ran and their outcome.
 
 - name: swe_bench
   sandbox:

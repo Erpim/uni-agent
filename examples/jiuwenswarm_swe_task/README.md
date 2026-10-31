@@ -17,6 +17,8 @@ code repair tasks.
   agent params for two tasks sharing one prompt template: `swe_rebench` (RL
   training) and `swe_bench` (evaluation).
 - **Training**: `run_train.sh` launches Megatron async PPO training.
+- **Inference**: `run_infer_jiuwenswarm.sh` runs the same recipe through verl's
+  inference path (`examples/inference/parallel_infer_verl.py`).
 
 ## Build
 
@@ -31,26 +33,57 @@ bash examples/jiuwenswarm_swe_task/build_tool.sh --pip-index https://pypi.tuna.t
 bash examples/jiuwenswarm_swe_task/build_tool.sh --registry swr.cn-east-3.myhuaweicloud.com/openyuanrong
 ```
 
-## Run (inference / evaluation)
+The recipe consumes a prebuilt tool image (see `sandbox_kwargs.mounts[].image_url`
+in `task_config_jiuwenswarm.yaml`); rebuild only when you change `run_agent.sh`
+or the pinned versions in `Dockerfile.jiuwenswarm-tool`.
 
-verl brings the engine up and routes rollouts through the agent-framework
-gateway:
+## Run (inference)
 
 ```bash
-ray job submit --address http://127.0.0.1:8265 \
-  -- python examples/inference/parallel_infer_verl.py \
-  --task-config examples/jiuwenswarm_swe_task/task_config_jiuwenswarm.yaml \
-  --data-path /path/to/swe_bench_verified.parquet \
-  --model-path /path/to/Qwen3.5-4B \
-  --tool-parser qwen3_coder --tensor-parallel-size 2 \
-  --nnodes 1 --n-gpus-per-node 2 --limit 1 --concurrency 1
+export OPENYUANRONG_SERVER_ADDRESS="<server address>"
+export OPENYUANRONG_TOKEN="<token>"
+
+LIMIT=1 N=1 CONCURRENCY=1 TENSOR_PARALLEL_SIZE=2 \
+  bash examples/jiuwenswarm_swe_task/run_infer_jiuwenswarm.sh
 ```
+
+Override `DATA_PATH`, `MODEL_PATH`, `TASK_CONFIG`, `LOG_DIR` and `RESULT_PATH`
+as needed. The Qwen3.5 checkpoint declares a vision tower, so the driver always
+passes `--language-model-only`.
 
 ## Training
 
 ```bash
 bash examples/jiuwenswarm_swe_task/run_train.sh
 ```
+
+## Trajectory selection: dropping context-compaction turns
+
+jiuwenswarm enables openjiuwen's context engine with three forked compressors
+(`dialogue`, `current_round`, `round_level`, all triggering at 0.8 of the
+context window). Each firing is an **extra model call** asking for an execution
+checkpoint in `<coverage_check>` + `<state_snapshot>` blocks. That call runs
+through the same policy gateway, so it **materializes as its own trajectory**:
+a summarization turn the policy did not need to learn.
+
+`run_train.sh` always wires `jiuwenswarm_compaction_filter.py` in as the
+runner's `custom_select_function` (RFC-0001), so those turns are dropped:
+
+```bash
+SELECT_FUNCTION_PY="${REPO_ROOT}/examples/jiuwenswarm_swe_task/jiuwenswarm_compaction_filter.py"
+SELECT_FUNCTION_NAME="select_without_compaction"
+```
+
+The filter keys off the two XML tags of the compression **request**. It must not
+key off `<memory_block>`: openjiuwen's `_extract_state_snapshot_or_raw` strips the
+tags and `_wrap_memory_block` then injects `<memory_block><summary>…</summary></memory_block>`
+into the **working** trajectory that did the real work. A filter matching
+`<memory_block>` would delete the task trajectory right after its first
+compaction.
+
+When a select function is configured the gateway also copies the chain's chat
+text into `extra_fields["message_history"]`; the framework releases it right after
+the selection step, before reward scoring and the TransferQueue write.
 
 ## Files
 
@@ -61,4 +94,6 @@ bash examples/jiuwenswarm_swe_task/run_train.sh
 | `run_agent.sh` | In-sandbox bash entrypoint |
 | `task_config_jiuwenswarm.yaml` | Task + sandbox defaults |
 | `run_train.sh` | Megatron RL training launch |
+| `run_infer_jiuwenswarm.sh` | Inference launch |
+| `jiuwenswarm_compaction_filter.py` | RFC-0001 selector dropping compression turns |
 | `README.md` | This file |
