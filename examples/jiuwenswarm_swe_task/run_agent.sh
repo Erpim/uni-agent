@@ -40,35 +40,31 @@ cd "$PROJECT_DIR"
 echo "" | jiuwenswarm-init >/dev/null 2>&1 || true
 mkdir -p "$JWS_WS/logs"
 
-# Trim the generated config (and the package template) to shrink the system prompt
-"$TOOL_BIN/python3.12" - "$JWS_WS/config/config.yaml" <<'PY' || echo "[warn] config trim failed" >&2
+# Patch the generated config and the package template. Unlike v11 this leaves the
+# stock tool/skill/subagent surface alone; only these four settings change, so the
+# per-turn system prompt stays at its shipped size. -P keeps the cwd off sys.path,
+# where a task repo could shadow one of the sidecar's own dependencies.
+"$TOOL_BIN/python3.12" -P - "$JWS_WS/config/config.yaml" <<'PY' || echo "[warn] config patch failed" >&2
 import importlib.util, os, sys
 from ruamel.yaml import YAML
 
 root = os.path.dirname(importlib.util.find_spec("jiuwenswarm").origin)
-version = None
-with open(os.path.join(root, "common", "_build_config.py"), encoding="utf-8") as f:
-    for line in f:
-        if line.startswith("VERSION"):
-            version = line.split("=", 1)[1].strip().strip("'\"")
-            break
 
-def trim(cfg):
-    cfg["auto_recap"]["enabled"] = False
-    cfg["symphony"]["skill_retrieval"]["enabled"] = False
-    cfg["react"]["skill_mode"] = "auto_list"
-    cfg["react"]["enable_task_loop"] = False
+def patch(cfg):
+    # null probes the endpoint with a synthetic image per (api_base, model_name);
+    # that probe's image trajectory breaks the rollout.
     cfg["react"]["enable_read_image_multimodal"] = False
-    cfg["react"]["subagent_runtime"]["enabled"] = False
-    subs = cfg["react"]["subagents"]
-    for name in ("statusline-setup", "general_agent", "browser_agent"):
-        subs[name]["enabled"] = False
-    subs["explore_agent"] = {"enabled": False}
-    subs["plan_agent"] = {"enabled": False}
-    cfg["modes"]["code"]["memory"]["enabled"] = False
-    cfg["modes"]["code"]["tools"] = []
-    if version:
-        cfg["config_version"] = version
+    # The task loop forces sys.maxsize as the ReAct budget, so it must be off for
+    # max_iterations to mean anything.
+    cfg["react"]["enable_task_loop"] = False
+    cfg["react"]["max_iterations"] = 150
+    # Compression makes its own model calls, each a separate trajectory. Keeping
+    # every message in the protected tail leaves an empty span, so it never fires.
+    context_engine = cfg["react"]["context_engine_config"]
+    for key in ("current_round_compressor_config", "round_level_compressor_config"):
+        section = context_engine.get(key)
+        if isinstance(section, dict):
+            section["keep_recent_messages"] = 1_000_000_000
 
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -81,8 +77,8 @@ for path in (sys.argv[1], os.path.join(root, "resources", "config.yaml")):
         continue
     with open(path, encoding="utf-8") as f:
         cfg = yaml.load(f)
-    trim(cfg)
-    tmp = path + ".trim.tmp"
+    patch(cfg)
+    tmp = path + ".patch.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         yaml.dump(cfg, f)
     os.replace(tmp, path)
@@ -94,17 +90,27 @@ MODEL_PROVIDER=Anthropic
 API_BASE=${JWS_API_BASE}
 MODEL_NAME=${JWS_MODEL_NAME:-unknown}
 API_KEY=${JWS_API_KEY:-EMPTY}
+# The gateway's default budget is ~60s (240 attempts at a 0.25s local cap); a
+# contended AgentServer misses it and the gateway exits before binding its port.
+# 2400 attempts is ~605s, inside the 660s waited below.
+AGENT_CONNECT_RETRY=2400
 EOF
 
-# Start gateway if not already listening
+# Start gateway if not already listening. app.py spawns its children with -m, so
+# the process cwd lands on sys.path; leaving the repo for the workspace keeps a
+# task repo from shadowing a sidecar dependency at import time.
 if ! (exec 3<>"/dev/tcp/127.0.0.1/$GATEWAY_PORT") 2>/dev/null; then
-  nohup jiuwenswarm-app >"$JWS_WS/logs/startup.log" 2>&1 &
-  for i in $(seq 1 180); do
+  ( cd "$JWS_WS" && nohup jiuwenswarm-app >"$JWS_WS/logs/startup.log" 2>&1 & )
+  for i in $(seq 1 660); do
     if (exec 3<>"/dev/tcp/127.0.0.1/$GATEWAY_PORT") 2>/dev/null; then
       echo "[ok] gateway ready on :$GATEWAY_PORT" >&2
       break
     fi
-    [ "$i" -eq 180 ] && { echo "[error] gateway timeout" >&2; exit 3; }
+    if [ "$i" -eq 660 ]; then
+      echo "[error] gateway timeout; startup.log tail:" >&2
+      tail -40 "$JWS_WS/logs/startup.log" >&2
+      exit 3
+    fi
     sleep 1
   done
 fi
@@ -115,7 +121,9 @@ fi
 CLI_OUT="$(printf '%s' "$TASK" | jiuwenswarm --mode code.normal --json \
   --cwd "$PROJECT_DIR" --trusted-dir "$PROJECT_DIR")"
 CLI_RC=$?
-if printf '%s' "$CLI_OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "ok" in d' 2>/dev/null; then
+# The sidecar's own python: the task image need not ship python3, and -P keeps
+# the repo from shadowing json.
+if printf '%s' "$CLI_OUT" | "$TOOL_BIN/python3.12" -P -c 'import json,sys; d=json.load(sys.stdin); assert "ok" in d' 2>/dev/null; then
   printf '%s\n' "$CLI_OUT"
 else
   printf '%s\n' "{\"exit_status\": \"error\", \"content\": \"\", \"error\": \"CLI failed rc=${CLI_RC}\"}"
