@@ -11,16 +11,18 @@
 #   ({problem_statement}, {language}).
 - name: swe_rebench
   sandbox:
-    provider: openyuanrong
+    provider: agent_dx
     runtime_timeout: 7200
     image_map:
       - from: "swerebench/sweb.eval.x86_64.**"
         to: "swr.cn-east-3.myhuaweicloud.com/openyuanrong/swe-rebench/**:latest"
+    image_mounts:
+      - image: swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:20261120-0.2.6-v12
+        mount_path: /opt/jiuwenswarm
     sandbox_kwargs:
       proxy_port: 38197
-      mounts:
-        - target: /opt/jiuwenswarm
-          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:20261120-0.2.6-v12
+      cpu_limit: 4000
+      mem_limit: 8192
   agent:
     name: jiuwenswarm
     run_timeout: 7200
@@ -49,16 +51,16 @@
 
 - name: swe_bench
   sandbox:
-    provider: openyuanrong
+    provider: agent_dx
     runtime_timeout: 7200
     image_map:
       - from: "swebench/**"
         to: "swr.cn-east-3.myhuaweicloud.com/openyuanrong/swe-bench-verified/**:v2"
+    image_mounts:
+      - image: swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:20261120-0.2.6-v12
+        mount_path: /opt/jiuwenswarm
     sandbox_kwargs:
       proxy_port: 38197
-      mounts:
-        - target: /opt/jiuwenswarm
-          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/jiuwenswarm-tool:20261120-0.2.6-v12
   agent:
     name: jiuwenswarm
     run_timeout: 7200

@@ -8,8 +8,8 @@ code repair tasks.
 
 - **Tool image**: `Dockerfile.jiuwenswarm-tool` builds a `FROM scratch` image
   with python-build-standalone + `workswarm` + `run_agent.sh` entrypoint.
-- **Sandbox**: openyuanrong remote sandbox with the tool image mounted at
-  `/opt/jiuwenswarm`.
+- **Sandbox**: `agent_dx` remote sandbox with the tool image mounted at
+  `/opt/jiuwenswarm` via `image_mounts`.
 - **Host agent**: `uni_agent/agents/jiuwenswarm/agent.py` (`JiuwenswarmAgent`)
   base64-pipes the task prompt into the bash entrypoint, passes the gateway
   config via env vars, and parses the result JSON.
@@ -40,8 +40,8 @@ or the pinned versions in `Dockerfile.jiuwenswarm-tool`.
 ## Run (inference)
 
 ```bash
-export OPENYUANRONG_SERVER_ADDRESS="<server address>"
-export OPENYUANRONG_TOKEN="<token>"
+export ADX_SERVER_ADDRESS="<server address>"
+export ADX_TOKEN="<token>"
 
 LIMIT=1 N=1 CONCURRENCY=1 TENSOR_PARALLEL_SIZE=2 \
   bash examples/jiuwenswarm_swe_task/run_infer_jiuwenswarm.sh

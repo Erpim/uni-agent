@@ -133,13 +133,16 @@ RUNNER_ARGS=(
     "+actor_rollout_ref.rollout.custom.agent_framework.mask_unfinished_episode=${MASK_UNFINISHED_EPISODE}"
 )
 
-# ── OpenYuanrong (remote sandbox) ───────────────────────────────────────
-# OPENYUANRONG_SERVER_ADDRESS / OPENYUANRONG_TOKEN are required by the provider.
+# ── Agent DX (remote sandbox) ───────────────────────────────────────
+# ADX_SERVER_ADDRESS / ADX_TOKEN are required by the provider.
 # Canonical SWE image refs are mapped to the sandbox registry via `image_map`
 # in the Task Config (task_config_jiuwenswarm.yaml), not here.
-OPENYUANRONG_SERVER_ADDRESS="${OPENYUANRONG_SERVER_ADDRESS:-}"
-OPENYUANRONG_TOKEN="${OPENYUANRONG_TOKEN:-}"
-OPENYUANRONG_TLS="${OPENYUANRONG_TLS:-1}"
+ADX_SERVER_ADDRESS="${ADX_SERVER_ADDRESS:-}"
+ADX_TOKEN="${ADX_TOKEN:-}"
+ADX_TLS="${ADX_TLS:-1}"
+ADX_TLS_VERIFY="${ADX_TLS_VERIFY:-1}"
+ADX_GATEWAY_TLS="${ADX_GATEWAY_TLS:-1}"
+ADX_TUNNEL_SSL_VERIFY="${ADX_TUNNEL_SSL_VERIFY:-1}"
 SANDBOX_NAME_PREFIX="${SANDBOX_NAME_PREFIX:-jiuwenswarm-}"
 
 # ── Logging & checkpointing ──────────────────────────────────────────────
@@ -159,9 +162,12 @@ VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-500}"
 # list below is guarded on this being set).
 RL_INSIGHT_SERVER_URL="${RL_INSIGHT_SERVER_URL:-}"
 
-export OPENYUANRONG_SERVER_ADDRESS
-export OPENYUANRONG_TOKEN
-export OPENYUANRONG_TLS
+export ADX_SERVER_ADDRESS
+export ADX_TOKEN
+export ADX_TLS
+export ADX_TLS_VERIFY
+export ADX_GATEWAY_TLS
+export ADX_TUNNEL_SSL_VERIFY
 export SANDBOX_NAME_PREFIX
 export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
 export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
@@ -218,9 +224,9 @@ fi
 # hydra keeps them as str, not int -- Ray requires Dict[str,str]). These keys
 # are declared statically:
 #   TRANSFER_QUEUE_ENABLE / NCCL_P2P_DISABLE / NCCL_SHM_DISABLE /
-#   SANDBOX_NAME_PREFIX / RL_INSIGHT_SERVER_URL / OPENYUANRONG_*
+#   SANDBOX_NAME_PREFIX / RL_INSIGHT_SERVER_URL / ADX_*
 #
-# The OPENYUANRONG_* credentials MUST ride the runtime_env: `ray job submit`
+# The ADX_* credentials MUST ride the runtime_env: `ray job submit`
 # launches the driver via the cluster-side Job Agent, which does NOT inherit
 # the submitting shell's environment, so a plain `export` would never reach
 # the rollout workers. Empty values are skipped (the provider has defaults).
@@ -233,9 +239,12 @@ RAY_INIT_ENV_ARGS=(
     "+ray_kwargs.ray_init.runtime_env.env_vars.NCCL_SHM_DISABLE=\"1\""
     "+ray_kwargs.ray_init.runtime_env.env_vars.SANDBOX_NAME_PREFIX=\"${SANDBOX_NAME_PREFIX}\""
     "+ray_kwargs.ray_init.runtime_env.env_vars.RL_INSIGHT_SERVER_URL=\"${RL_INSIGHT_SERVER_URL}\""
-    "+ray_kwargs.ray_init.runtime_env.env_vars.OPENYUANRONG_SERVER_ADDRESS=\"${OPENYUANRONG_SERVER_ADDRESS}\""
-    "+ray_kwargs.ray_init.runtime_env.env_vars.OPENYUANRONG_TOKEN=\"${OPENYUANRONG_TOKEN}\""
-    "+ray_kwargs.ray_init.runtime_env.env_vars.OPENYUANRONG_TLS=\"${OPENYUANRONG_TLS}\""
+    "+ray_kwargs.ray_init.runtime_env.env_vars.ADX_SERVER_ADDRESS=\"${ADX_SERVER_ADDRESS}\""
+    "+ray_kwargs.ray_init.runtime_env.env_vars.ADX_TOKEN=\"${ADX_TOKEN}\""
+    "+ray_kwargs.ray_init.runtime_env.env_vars.ADX_TLS=\"${ADX_TLS}\""
+    "+ray_kwargs.ray_init.runtime_env.env_vars.ADX_TLS_VERIFY=\"${ADX_TLS_VERIFY}\""
+    "+ray_kwargs.ray_init.runtime_env.env_vars.ADX_GATEWAY_TLS=\"${ADX_GATEWAY_TLS}\""
+    "+ray_kwargs.ray_init.runtime_env.env_vars.ADX_TUNNEL_SSL_VERIFY=\"${ADX_TUNNEL_SSL_VERIFY}\""
 )
 # TRANSFER_QUEUE_ENABLE is a REQUIRED key here: verl main_ppo overwrites it to
 # "1" itself when transfer_queue.enable=True. It must already exist in the
